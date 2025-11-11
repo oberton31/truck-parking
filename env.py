@@ -21,10 +21,10 @@ import cv2
 import numpy as np
 import time
 
-SHOW_PREVIEW = -1
+SHOW_PREVIEW = True
 IM_WIDTH = 640
 IM_HEIGHT = 480
-RENDER_CARLA = True # SET TO FALSE FOR TRAINING
+RENDER_CARLA = False # SET TO FALSE FOR TRAINING
 
 class TruckEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -146,7 +146,7 @@ class TruckEnv:
         reverse = False
 
 
-        return (self.image_list, pos_list, vel_list, trailer_angle, reverse) # TODO: talk about this some more
+        return (self.image_list, pos_list, vel_list, trailer_angle, reverse), self.goal_pos # TODO: talk about this some more
 
     def step(self, action):
         # TODO: Discuss action space
@@ -159,7 +159,7 @@ class TruckEnv:
             self.control.throttle = 0.0
 
         if action[1]:
-            self.control.brake = min(self._control.brake + 0.2, 1)
+            self.control.brake = min(self.control.brake + 0.2, 1)
         else:
             self.control.brake = 0.0
         
@@ -167,7 +167,7 @@ class TruckEnv:
         # gradually (do not jump instantly to full turn)
         # Think of it this way: steer_cache holds steering wheel input, and steer holds actual tire steering
 
-        steer_increment = 5e-4 * self.world.get_settings().fixed_delta_seconds * 0.001 # put into milliseconds
+        steer_increment = 5e-4 * self.world.get_settings().fixed_delta_seconds * 1000 # milliseconds
         if action[2]:
             if self.steer_cache > 0:
                 self.steer_cache = 0
@@ -180,11 +180,11 @@ class TruckEnv:
                 self.steer_cache += steer_increment
         else:
             self.steer_cache = 0.0
-        self.steer_cache = min(0.7, max(-0.7, self.steer_cache))            
-        
+        self.steer_cache = min(0.7, max(-0.7, self.steer_cache))      
+        self.control.steer = round(self.steer_cache, 1)
+
         if action[4]:
-            self.control.gear = 1 if self.control.reverse else -1
-            print(self.control.reverse)
+            self.control.reverse = not self.control.reverse
 
         self.player.apply_control(self.control)
 
@@ -205,6 +205,11 @@ class TruckEnv:
         if self._at_goal():
             terminated = True
             reward = 10
+
+        if self.SHOW_CAM:
+            for i in range(len(self.image_list)):
+                cv2.imshow(f"img{i}", self.image_list[i])
+                cv2.waitKey(1)
         
         pos = self.player.get_transform()
         pos_trailer = self.playerTrailer.get_transform()
@@ -217,7 +222,7 @@ class TruckEnv:
 
         obs = (self.image_list, pos_list, vel_list, trailer_angle, self.control.reverse)
 
-        return obs, reward, terminated, truncated
+        return obs, self.goal_pos, reward, terminated, truncated # obs, goal, reward, terminated, truncated
 
 
     def _at_goal(self, pos_tol=0.01, angle_tol=0.1, trailer_tol=0.1, vel_tol = 0.01):
@@ -252,7 +257,7 @@ class TruckEnv:
         self.rgb_cam = self.world.get_blueprint_library().find('sensor.camera.rgb')
         self.rgb_cam.set_attribute('image_size_x', f'{self.im_width}')
         self.rgb_cam.set_attribute('image_size_y', f'{self.im_height}')
-        self.rgb_cam.set_attribute('fov', '110')
+        self.rgb_cam.set_attribute('fov', '110') # talk to Rodrigo about changing the size + FOV
 
         Attachment = carla.AttachmentType
 
@@ -269,7 +274,7 @@ class TruckEnv:
                 (carla.Transform(carla.Location(x=+0.8*player_bound_x, y=+0.0*player_bound_y, z=1.3*player_bound_z)), Attachment.Rigid), # on cab
                 (carla.Transform(carla.Location(x=0, y=0.8*playerTrailer_bound_y, z=1.3*player_bound_z), carla.Rotation(yaw=90)), Attachment.Rigid), # on trailer
                 (carla.Transform(carla.Location(x=0, y=-0.8*playerTrailer_bound_y, z=1.3*playerTrailer_bound_z), carla.Rotation(yaw=-90)), Attachment.Rigid), # on trailer
-                (carla.Transform(carla.Location(x=-2.1*player_bound_x, y=0, z=1.3*playerTrailer_bound_y), carla.Rotation(yaw=180)), Attachment.Rigid), # on trailer
+                (carla.Transform(carla.Location(x=-2.1* playerTrailer_bound_x, y=0, z=1.3*playerTrailer_bound_y), carla.Rotation(yaw=180)), Attachment.Rigid), # on trailer
         ]
         
         self.image_list = [None] * len(camera_transforms)
@@ -292,11 +297,7 @@ class TruckEnv:
 
         i2 = image.reshape((self.im_height, self.im_width, 4))
         i3 = i2[:, :, :3]
-        
-        if id == self.SHOW_CAM:
-            cv2.imshow("", i3)
-            cv2.waitKey(1)
-        
+                
         self.image_list[id] = i3
 
     def _get_actor_blueprints(self, world, filter, generation):
@@ -345,11 +346,19 @@ if __name__ == "__main__":
     env.reset()
     action = [0] * env.action_ndim
     action[0] = 1
+    #action[4] = 1
+    #action[3] = 1
     try:
+        step = 0
         while True:
-            _, reward, terminated, truncated = env.step(action)
+            _, _, reward, terminated, truncated = env.step(action)
             #print(reward)
-
+            #action[4] = 0
+            #action[2]
+            # if step > 100:
+            #     action[0] = 0
+            #     action[1] = 1
+            # step += 1
             if terminated or truncated:
                 env.reset()
     except Exception as e:
