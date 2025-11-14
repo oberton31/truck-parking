@@ -32,7 +32,10 @@ class TruckEnv:
     im_width = IM_WIDTH
     im_height = IM_HEIGHT
 
-    def __init__(self, max_steps=100000, goal_idx=None):
+    # Phase 0: no additional vehicles, but penalized if collides with building or itself
+    # Phase 1: add other vehicles but minor penalty for collisions
+    # Phase 3: full penalties for collisions, and episode terminates
+    def __init__(self, max_steps=10000, goal_idx=None, phase=0):
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(20.0)
         self.world = self.client.load_world('Town10HD')
@@ -62,7 +65,6 @@ class TruckEnv:
         self.blueprintTrailer.set_attribute('role_name', 'hero-trailer')
     
         self.actor_list = []
-        self.collision_hist = []
         self.image_list = []
 
         self.control = carla.VehicleControl()
@@ -78,11 +80,6 @@ class TruckEnv:
         settings.no_rendering_mode = not RENDER_CARLA
         self.world.apply_settings(settings)
 
-        spawn_points = [
-            carla.Transform(carla.Location(-41, 171, 1), carla.Rotation(0, -90, 0)),
-        ]
-
-
         self.goal_pos = None
 
         self.goal_points = [
@@ -95,6 +92,8 @@ class TruckEnv:
 
         self.goal_idx = goal_idx
         self.spawn_bounds = [-65, 157, -40, 188]  # x_min, y_min, x_max, y_max
+        self.collision = False
+        self.phase = phase
 
     def reset(self):
         # TODO: define spawn point and goal point
@@ -137,6 +136,8 @@ class TruckEnv:
         self.actor_list.append(self.playerTrailer)
         self.actor_list.append(self.player)
 
+        self.collision = False
+
         # spawn cameras
         self.rgb_sensors = self._spawn_cameras()
 
@@ -146,7 +147,6 @@ class TruckEnv:
         trailer_angle = pos.rotation.yaw - pos_trailer.rotation.yaw # right hand rule from cab to trailer
         vel = self.player.get_velocity()
 
-        self.collision_hist = []
         collision_blueprint = self.world.get_blueprint_library().find('sensor.other.collision')
         self.player_collision_sensor = self.world.spawn_actor(collision_blueprint, carla.Transform(), attach_to=self.player)
 
@@ -192,22 +192,38 @@ class TruckEnv:
         # advance env
         self.world.tick()
 
-        reward = -0.01
+        reward = 0
         terminated = False
         truncated = False
 
-        if len(self.collision_hist) != 0:
-            terminated = True
-            reward = -10
-        
-        if self.curr_steps >= self.max_steps:
-            truncated = True
-        
+
         if self._at_goal():
             terminated = True
             if RENDER_CARLA:
                 print("At Goal!")
-            reward = 10
+            reward += 15.0
+
+        if self.collision:
+            if self.phase == 2:
+                terminated = True
+                reward = -1
+            elif self.phase == 1:
+                reward += -0.1
+            self.collision = False # reset collision flag for next step
+        
+        # dense rewards for distance and orientation
+        player_pos = self.player.get_transform()
+        dist_to_goal = math.sqrt((self.goal_pos.location.x - player_pos.location.x)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
+        reward += min(0, -dist_to_goal / 100) # should roughly be between 0 and -0.5 (max values of dist are around 50)
+
+        player_yaw = player_pos.rotation.yaw % 360
+        goal_yaw = self.goal_pos.rotation.yaw % 360
+        yaw_diff = abs(player_yaw - goal_yaw)
+        yaw_diff = min(yaw_diff, 360 - yaw_diff)  # account for wrap-around
+        reward += min(0, -yaw_diff / 180 / 10) # should be between 0 and -0.1
+
+        if self.curr_steps >= self.max_steps:
+            truncated = True        
 
         if self.SHOW_CAM:
             for i in range(len(self.image_list)):
@@ -224,6 +240,9 @@ class TruckEnv:
         vel_list = [vel.x, vel.y, vel.z]
 
         obs = (self.image_list, pos_list, vel_list, trailer_angle, self.control.reverse, self.goal_pos)
+
+        if RENDER_CARLA:
+            print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw Diff: {yaw_diff:.2f}")
 
         return obs, reward, terminated, truncated # obs, goal, reward, terminated, truncated
 
@@ -256,8 +275,8 @@ class TruckEnv:
         if (event.other_actor.type_id != "static.ground"):
             if RENDER_CARLA:
                 print(event)
-                print(event.other_actor.type_id)
-            self.collision_hist.append(event)
+                print(event.other_actor.type_id)            
+            self.collision = True
     
     def _spawn_cameras(self):
         # Should initialize cameras and get them to start listening

@@ -132,7 +132,7 @@ class PygameController:
 
 if __name__ == "__main__":
     env = TruckEnv(max_steps=1000000)
-    env.reset()
+    obs = env.reset()
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     save_dir = os.path.join(SAVE_PATH, timestamp)
     os.makedirs(save_dir, exist_ok=True)
@@ -142,46 +142,57 @@ if __name__ == "__main__":
 
     buffer = []
     chunk_idx = 0
-    try:
-        episode = 0
+    episode = 0
 
-        step = 0
+    try:
         episode_dir = os.path.join(save_dir, f"episode_{episode:03d}")
         os.makedirs(episode_dir, exist_ok=True)
+
         while True:
+            state = obs
+
             action = controller.get_action()
             if action is None:
                 print("Quit requested by user")
                 break
 
-            obs, reward, terminated, truncated = env.step(action)
 
+            next_obs, reward, terminated, truncated = env.step(action)
 
             buffer.append(dict(
-                images=np.stack(obs[0], axis=0),
-                pos=np.array(obs[1], dtype=np.float32),
-                vel=np.array(obs[2], dtype=np.float32),
-                trailer_angle=np.array(obs[3], dtype=np.float32),
-                goal=np.array(obs[4], dtype=np.float32),
+                images=np.stack(state[0], axis=0),
+                pos=np.array(state[1], dtype=np.float32),
+                vel=np.array(state[2], dtype=np.float32),
+                trailer_angle=np.array(state[3], dtype=np.float32),
+                goal=np.array(state[4], dtype=np.float32),
+
                 actions=np.array(action, dtype=np.float32),
                 reward=np.array(reward, dtype=np.float32),
                 done=np.array(terminated or truncated, dtype=np.uint8),
                 timestamp=np.array(time.time(), dtype=np.float64),
+
+                next_images=np.stack(next_obs[0], axis=0),
+                next_pos=np.array(next_obs[1], dtype=np.float32),
+                next_vel=np.array(next_obs[2], dtype=np.float32),
+                next_trailer_angle=np.array(next_obs[3], dtype=np.float32),
+                next_goal=np.array(next_obs[4], dtype=np.float32),
             ))
 
             if len(buffer) >= CHUNK_SIZE or terminated or truncated:
                 save_path = os.path.join(episode_dir, f"chunk_{chunk_idx:04d}.npz")
                 saver.save(save_path, {"frames": buffer})
-                buffer = []  # clear buffer
-                chunk_idx += 1          
+                buffer = []
+                chunk_idx += 1
 
             if terminated or truncated:
                 print("Episode finished, resetting env")
-                env.reset()
+                obs = env.reset()
                 episode += 1
                 episode_dir = os.path.join(save_dir, f"episode_{episode:03d}")
                 os.makedirs(episode_dir, exist_ok=True)
                 chunk_idx = 0
+            else:
+                obs = next_obs
     finally:
         env.destroy()
         pygame.quit()
