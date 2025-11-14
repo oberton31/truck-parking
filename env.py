@@ -35,7 +35,7 @@ class TruckEnv:
     # Phase 0: no additional vehicles, but penalized if collides with building or itself
     # Phase 1: add other vehicles but minor penalty for collisions
     # Phase 3: full penalties for collisions, and episode terminates
-    def __init__(self, max_steps=10000, goal_idx=None, phase=0):
+    def __init__(self, max_steps=10000, goal_idx=None, phase=1):
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(20.0)
         self.world = self.client.load_world('Town10HD')
@@ -111,11 +111,10 @@ class TruckEnv:
             print(f"Using random goal: {rand_goal[1]}")
 
         self.actor_list = []
-        # spawn_point = carla.Transform(carla.Location(-41, 171, 1), carla.Rotation(0, -90, 0))
 
         self.player = None
         self.playerTrailer = None
-        while self.playerTrailer is None and self.player is None:
+        while self.playerTrailer is None or self.player is None:
             self.player = None
             self.playerTrailer = None
             spawn_point = carla.Transform()
@@ -203,6 +202,7 @@ class TruckEnv:
                 print("At Goal!")
             reward += 15.0
 
+        collision = self.collision
         if self.collision:
             if self.phase == 2:
                 terminated = True
@@ -211,16 +211,20 @@ class TruckEnv:
                 reward += -0.1
             self.collision = False # reset collision flag for next step
         
-        # dense rewards for distance and orientation
+        # dense rewards for distance, orientation, trailer angle
         player_pos = self.player.get_transform()
         dist_to_goal = math.sqrt((self.goal_pos.location.x - player_pos.location.x)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
-        reward += min(0, -dist_to_goal / 100) # should roughly be between 0 and -0.5 (max values of dist are around 50)
+        reward += min(0, -dist_to_goal / 200) # should roughly be between 0 and -0.2 (max values of dist are around 40)
 
         player_yaw = player_pos.rotation.yaw % 360
         goal_yaw = self.goal_pos.rotation.yaw % 360
         yaw_diff = abs(player_yaw - goal_yaw)
         yaw_diff = min(yaw_diff, 360 - yaw_diff)  # account for wrap-around
         reward += min(0, -yaw_diff / 180 / 10) # should be between 0 and -0.1
+
+        trailer_pos = self.playerTrailer.get_transform()
+        trailer_angle_error = np.abs(player_pos.rotation.yaw - trailer_pos.rotation.yaw)
+        reward += min(0, -trailer_angle_error / 90 / 10)
 
         if self.curr_steps >= self.max_steps:
             truncated = True        
@@ -241,8 +245,8 @@ class TruckEnv:
 
         obs = (self.image_list, pos_list, vel_list, trailer_angle, self.control.reverse, self.goal_pos)
 
-        if RENDER_CARLA:
-            print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw Diff: {yaw_diff:.2f}")
+        if RENDER_CARLA and self.curr_steps % 100 == 0:
+            print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw Diff: {yaw_diff:.2f}, Collision: {collision}")
 
         return obs, reward, terminated, truncated # obs, goal, reward, terminated, truncated
 
@@ -272,10 +276,7 @@ class TruckEnv:
 
     def _on_collision(self, event):
         # filtering out collisions with the ground which seem to be erroneous
-        if (event.other_actor.type_id != "static.ground"):
-            if RENDER_CARLA:
-                print(event)
-                print(event.other_actor.type_id)            
+        if (event.other_actor.type_id != "static.ground"):           
             self.collision = True
     
     def _spawn_cameras(self):
