@@ -115,6 +115,11 @@ class TruckEnv:
         self.player = None
         self.playerTrailer = None
         while self.playerTrailer is None or self.player is None:
+            if self.player is not None: 
+                self.player.destroy()
+            if self.playerTrailer is not None:
+                self.playerTrailer.destroy()
+            self.world.tick()
             self.player = None
             self.playerTrailer = None
             spawn_point = carla.Transform()
@@ -217,13 +222,21 @@ class TruckEnv:
         reward += min(0, -dist_to_goal / 200) # should roughly be between 0 and -0.2 (max values of dist are around 40)
 
         player_yaw = player_pos.rotation.yaw % 360
-        goal_yaw = self.goal_pos.rotation.yaw % 360
-        yaw_diff = abs(player_yaw - goal_yaw)
-        yaw_diff = min(yaw_diff, 360 - yaw_diff)  # account for wrap-around
-        reward += min(0, -yaw_diff / 180 / 10) # should be between 0 and -0.1
+        if player_yaw > 180: player_yaw -= 360
+        elif player_yaw < -180: player_yaw += 360
 
+        goal_yaw = self.goal_pos.rotation.yaw % 360
+        if goal_yaw > 180: goal_yaw -= 360
+        elif goal_yaw < -180: goal_yaw += 360
+
+        yaw_diff = player_yaw - goal_yaw
+        if yaw_diff > 180: yaw_diff -= 360
+        elif yaw_diff < -180: yaw_diff += 360
+        yaw_diff = abs(yaw_diff)
+        reward += min(0, yaw_diff / 180 / 10) # should be between 0 and -0.1
         trailer_pos = self.playerTrailer.get_transform()
-        trailer_angle_error = np.abs(player_pos.rotation.yaw - trailer_pos.rotation.yaw)
+        trailer_angle_error = np.abs(player_pos.rotation.yaw % 360 - trailer_pos.rotation.yaw % 360) # this error should be between 0 and 90
+        trailer_angle_error = min(trailer_angle_error, 360 - trailer_angle_error)  # account for wrap-around
         reward += min(0, -trailer_angle_error / 90 / 10)
 
         if self.curr_steps >= self.max_steps:
@@ -237,7 +250,19 @@ class TruckEnv:
         pos = self.player.get_transform()
         pos_trailer = self.playerTrailer.get_transform()
 
-        trailer_angle = pos.rotation.yaw - pos_trailer.rotation.yaw
+        # should be between -180 and 180
+        cab_yaw = pos.rotation.yaw % 360
+        if cab_yaw > 180: cab_yaw -= 360
+        elif cab_yaw < -180: cab_yaw += 360
+
+        trailer_yaw = pos_trailer.rotation.yaw % 360
+        if trailer_yaw > 180: trailer_yaw -= 360
+        elif trailer_yaw < -180: trailer_yaw += 360
+
+        trailer_angle = cab_yaw - trailer_yaw
+        if trailer_angle > 180: trailer_angle -= 360
+        elif trailer_angle < -180: trailer_angle += 360
+
         vel = self.player.get_velocity()
 
         pos_list = [pos.location.x, pos.location.y, pos.location.z, pos.rotation.pitch, pos.rotation.yaw, pos.rotation.roll]
@@ -246,7 +271,7 @@ class TruckEnv:
         obs = (self.image_list, pos_list, vel_list, trailer_angle, self.control.reverse, self.goal_pos)
 
         if RENDER_CARLA and self.curr_steps % 100 == 0:
-            print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw Diff: {yaw_diff:.2f}, Collision: {collision}")
+            print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw: {pos.rotation.yaw:.2f}, Yaw Diff: {yaw_diff:.2f}, Trailer Angle: {trailer_angle:.2f}, Collision: {collision}")
 
         return obs, reward, terminated, truncated # obs, goal, reward, terminated, truncated
 
@@ -259,11 +284,36 @@ class TruckEnv:
         pos_dist = np.sqrt((self.goal_pos.location.x - player_pos.location.x)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
         
         # only care about yaw
-        angle_dist = np.abs(self.goal_pos.rotation.yaw - player_pos.rotation.yaw)
+        player_yaw = player_pos.rotation.yaw % 360
+        if player_yaw > 180: player_yaw -= 360
+        elif player_yaw < -180: player_yaw += 360
+
+        goal_yaw = self.goal_pos.rotation.yaw % 360
+        if goal_yaw > 180: goal_yaw -= 360
+        elif goal_yaw < -180: goal_yaw += 360
+        angle_dist = player_yaw - goal_yaw
+        if angle_dist > 180: angle_dist -= 360
+        elif angle_dist < -180: angle_dist += 360
+
+        angle_dist = np.abs(angle_dist)
+        angle_dist = min(angle_dist, 360 - angle_dist)  # account for wrap-around
 
         trailer_pos = self.playerTrailer.get_transform()
         # tractor angle
-        trailer_angle_error = np.abs(player_pos.rotation.yaw - trailer_pos.rotation.yaw)
+        cab_yaw = player_pos.rotation.yaw % 360
+        if cab_yaw > 180: cab_yaw -= 360
+        elif cab_yaw < -180: cab_yaw += 360
+
+        trailer_yaw = trailer_pos.rotation.yaw % 360
+        if trailer_yaw > 180: trailer_yaw -= 360
+        elif trailer_yaw < -180: trailer_yaw += 360
+        trailer_angle = cab_yaw - trailer_yaw
+        if trailer_angle > 180: trailer_angle -= 360
+        elif trailer_angle < -180: trailer_angle += 360
+
+        trailer_angle_error = np.abs(trailer_angle)
+
+        trailer_angle_error = min(trailer_angle_error, 360 - trailer_angle_error)  # account for wrap-around
 
         # vel
         vel = self.player.get_velocity()

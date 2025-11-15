@@ -181,7 +181,8 @@ if __name__ == "__main__":
             if len(buffer) >= CHUNK_SIZE or terminated or truncated:
                 save_path = os.path.join(episode_dir, f"chunk_{chunk_idx:04d}.npz")
                 saver.save(save_path, {"frames": buffer})
-                buffer = []
+                # delete buffer contents from memory
+                buffer.clear()
                 chunk_idx += 1
 
             if terminated or truncated:
