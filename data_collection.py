@@ -4,11 +4,11 @@ import os
 import pygame
 
 SAVE_PATH = "data/"
-CHUNK_SIZE = 25  # number of frames per save chunk
+CHUNK_SIZE = 15  # number of frames per save chunk (reduced to limit memory per chunk)
 
 import numpy as np
 
-import threading
+import multiprocessing as mp
 import queue
 import sys
 import math
@@ -22,29 +22,48 @@ else:
     from ConfigParser import RawConfigParser as ConfigParser
 
 class AsyncSaver:
-    def __init__(self, max_queue=100):
-        self.queue = queue.Queue(max_queue)
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
+    def __init__(self, max_queue=10, n_workers=None):
+        self.queue = mp.Queue(max_queue)
+        self.n_workers = n_workers or max(1, mp.cpu_count() - 1)
+        self.workers = []
+        for _ in range(self.n_workers):
+            p = mp.Process(target=self._worker, daemon=True)
+            p.start()
+            self.workers.append(p)
 
     def _worker(self):
+        import numpy as _np
+        import gc as _gc
         while True:
             item = self.queue.get()
             if item is None:
                 break
             save_path, data = item
-            np.savez_compressed(save_path, **data)
-            self.queue.task_done()
+            try:
+                _np.savez_compressed(save_path, **data)
+            except Exception as e:
+                print("Save error:", e)
+            try:
+                del data
+            except Exception:
+                pass
+            _gc.collect()
 
     def save(self, save_path, data):
         try:
             self.queue.put_nowait((save_path, data))
         except queue.Full:
-            print("Save queue full, skipping frame to keep up realtime speed")
+            print("Save queue full, skipping")
 
     def close(self):
-        self.queue.put(None)
-        self.thread.join()
+        # send poison pills for each worker
+        for _ in range(len(self.workers)):
+            try:
+                self.queue.put(None)
+            except Exception:
+                pass
+        for p in self.workers:
+            p.join()
 
 class PygameController:
 
@@ -138,7 +157,7 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
 
     controller = PygameController()
-    saver = AsyncSaver(max_queue=200)
+    saver = AsyncSaver(max_queue=20, n_workers=3)
 
     buffer = []
     chunk_idx = 0
@@ -171,22 +190,26 @@ if __name__ == "__main__":
                 done=np.array(terminated or truncated, dtype=np.uint8),
                 timestamp=np.array(time.time(), dtype=np.float64),
 
-                next_images=np.stack(next_obs[0], axis=0),
-                next_pos=np.array(next_obs[1], dtype=np.float32),
-                next_vel=np.array(next_obs[2], dtype=np.float32),
-                next_trailer_angle=np.array(next_obs[3], dtype=np.float32),
-                next_goal=np.array(next_obs[4], dtype=np.float32),
+                # next_images=np.stack(next_obs[0], axis=0),
+                # next_pos=np.array(next_obs[1], dtype=np.float32),
+                # next_vel=np.array(next_obs[2], dtype=np.float32),
+                # next_trailer_angle=np.array(next_obs[3], dtype=np.float32),
+                # next_goal=np.array(next_obs[4], dtype=np.float32),
             ))
 
             if len(buffer) >= CHUNK_SIZE or terminated or truncated:
                 save_path = os.path.join(episode_dir, f"chunk_{chunk_idx:04d}.npz")
                 saver.save(save_path, {"frames": buffer})
                 # delete buffer contents from memory
-                buffer.clear()
+                buffer = []
                 chunk_idx += 1
 
             if terminated or truncated:
                 print("Episode finished, resetting env")
+                # wait until all saves are done
+                while not saver.queue.empty():
+                    time.sleep(0.1)
+                print("All saves complete for episode")
                 obs = env.reset()
                 episode += 1
                 episode_dir = os.path.join(save_dir, f"episode_{episode:03d}")

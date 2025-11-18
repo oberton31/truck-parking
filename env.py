@@ -24,7 +24,7 @@ import math
 SHOW_PREVIEW = False
 IM_WIDTH = 640
 IM_HEIGHT = 480
-RENDER_CARLA = True # SET TO FALSE FOR TRAINING
+RENDER_CARLA = False # SET TO FALSE FOR TRAINING
 
 class TruckEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -60,6 +60,7 @@ class TruckEnv:
         if self.blueprint.has_attribute('speed'):
             self.player_max_speed = float(self.blueprint.get_attribute('speed').recommended_values[1])
             self.player_max_speed_fast = float(self.blueprint.get_attribute('speed').recommended_values[2])
+
         # get trailer blueprint
         self.blueprintTrailer = self._get_actor_blueprints(self.world, "trailer", self._actor_generation)[0]
         self.blueprintTrailer.set_attribute('role_name', 'hero-trailer')
@@ -267,6 +268,7 @@ class TruckEnv:
 
         pos_list = [pos.location.x, pos.location.y, pos.location.z, pos.rotation.pitch, pos.rotation.yaw, pos.rotation.roll]
         vel_list = [vel.x, vel.y, vel.z]
+        #print(vel_list)
 
         obs = (self.image_list, pos_list, vel_list, trailer_angle, self.control.reverse, self.goal_pos)
 
@@ -424,14 +426,14 @@ if __name__ == "__main__":
     env.reset()
     action = [0] * env.action_ndim
     action[0] = 1
-    action[4] = 1
+    #action[4] = 1
     #action[3] = 1
     try:
         step = 0
         while True:
             _, reward, terminated, truncated = env.step(action)
             #print(reward)
-            action[4] = 0
+            #action[4] = 0
             #action[2]
             # if step > 100:
             #     action[0] = 0
