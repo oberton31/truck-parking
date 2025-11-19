@@ -102,38 +102,6 @@ def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu'):
     return imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t
 
 
-class AsyncSaverSimple:
-    """Simple synchronous saver used to write .npz chunks (no multiprocessing).
-    Kept small to avoid extra dependencies; used only when --save_dir is provided.
-    """
-    def __init__(self, save_dir, chunk_size=15):
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.chunk_size = chunk_size
-        self.buffer = []
-        self.chunk_idx = 0
-
-    def append(self, frame_dict):
-        self.buffer.append(frame_dict)
-        if len(self.buffer) >= self.chunk_size:
-            self._flush()
-
-    def _flush(self):
-        if len(self.buffer) == 0:
-            return
-        fname = self.save_dir / f"chunk_{self.chunk_idx:04d}.npz"
-        try:
-            np.savez_compressed(str(fname), frames=self.buffer)
-            print(f"Saved {fname}")
-        except Exception as e:
-            print(f"Failed to save {fname}: {e}")
-        self.buffer = []
-        self.chunk_idx += 1
-
-    def close(self):
-        self._flush()
-
-
 def run_loop(args):
     device = torch.device(args.device if args.device is not None else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
@@ -147,10 +115,6 @@ def run_loop(args):
     state = ckpt.get('model_state', ckpt)
     model.load_state_dict(state)
     model.eval()
-
-    saver = None
-    if args.save_dir is not None:
-        saver = AsyncSaverSimple(args.save_dir, chunk_size=args.save_chunk)
 
     step = 0
     try:
@@ -170,32 +134,23 @@ def run_loop(args):
             mean = mean.squeeze(0).cpu().numpy()  # (5,)
             # mean[0:2] in [0,1], mean[2] in [-2,2], mean[3:5] in [0,1]
 
-            throttle = float(np.clip(mean[0], 0.0, 1.0))
-            brake = float(np.clip(mean[1], 0.0, 1.0))
+            #if (step < 1000): throttle = 1.0  # warmup period
+            #else: 
+            if (step < 100): throttle = 0.5
+            else: throttle = float(np.clip(mean[0], 0.0, 1.0))
+            brake = 0
+            #brake = float(np.clip(mean[1], 0.0, 1.0))
             steer = float(mean[2])  
             
             rev_toggle = bool(mean[3] >= 0.5)
             handbrake = bool(mean[4] >= 0.5)
             
-            action = [throttle, brake, steer, rev_toggle, float(handbrake)]
-
+            if (rev_toggle): 
+                print("TOGGLED GEAR")
+            action = [throttle, brake, steer, float(rev_toggle), float(handbrake)]
+            
+            #print(f"Step {step}: action = {action}")
             next_obs, reward, terminated, truncated = env.step(action)
-
-            # Optionally save data collected by the model
-            if saver is not None:
-                saver.append(dict(
-                    images=np.stack(obs[0], axis=0),
-                    pos=np.array(obs[1], dtype=np.float32),
-                    vel=np.array(obs[2], dtype=np.float32),
-                    accel=np.array(obs[3], dtype=np.float32),
-                    trailer_angle=np.array(obs[4], dtype=np.float32),
-                    reverse=np.array(obs[5], dtype=np.float32),
-                    goal=np.array(obs[6], dtype=np.float32),
-                    actions=np.array(action, dtype=np.float32),
-                    reward=np.array(reward, dtype=np.float32),
-                    done=np.array(terminated or truncated, dtype=np.uint8),
-                    timestamp=np.array(time.time(), dtype=np.float64),
-                ))
 
             obs = next_obs
             step += 1
@@ -211,8 +166,6 @@ def run_loop(args):
     except KeyboardInterrupt:
         print("Keyboard interrupt, shutting down")
     finally:
-        if saver is not None:
-            saver.close()
         env.destroy()
 
 
@@ -223,8 +176,6 @@ def main():
     parser.add_argument('--pretrained', action='store_true')
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--max_steps', type=int, default=10000)
-    parser.add_argument('--save_dir', type=str, default=None, help='Optional directory to save model-collected chunks (.npz)')
-    parser.add_argument('--save_chunk', type=int, default=15)
     parser.add_argument('--stats', type=str, default=None, help='Optional path to .norm_stats.json used for vel/accel normalization')
     parser.add_argument('--phase', type=int, default=1, help='Env phase (collision penalties)')
     args = parser.parse_args()
