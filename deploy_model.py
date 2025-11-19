@@ -31,6 +31,9 @@ import torchvision.transforms as T
 from model import TruckNet
 from env import TruckEnv
 
+# Optional OpenCV-based visualizer for actions (used when --gui is passed)
+# We import cv2 lazily inside run_loop so missing dependency is handled gracefully.
+
 
 # Workspace bounds - same as dataset preprocessing
 WORKSPACE_BOUNDS = np.array([-69, 157, -30, 200])
@@ -102,6 +105,65 @@ def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu'):
     return imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t
 
 
+def _update_visualizer_cv(vis, action):
+    """Draw a simple HUD using OpenCV showing throttle, brake, steer angle and gear flags.
+
+    action: [throttle, brake, steer, rev, handbrake]
+    """
+    cv2 = vis['cv2']
+    win = vis['win_name']
+    W, H = vis['W'], vis['H']
+
+    throttle, brake, steer, rev_f, handbrake = action
+
+    # background
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    img[:] = (30, 30, 30)
+
+    # steering wheel: center-left
+    cx, cy = 110, (H // 2) - 30
+    radius = 60
+    cv2.circle(img, (cx, cy), radius, (200, 200, 200), 6)
+
+    # steering indicator line
+    max_steer_deg = 45.0
+    steer_norm = max(-1.0, min(1.0, steer / 2.0)) if abs(steer) > 0 else steer / 2.0
+    angle_rad = -steer_norm * max_steer_deg * np.pi / 180.0
+    lx = int(cx + (radius - 10) * np.cos(angle_rad))
+    ly = int(cy + (radius - 10) * np.sin(angle_rad)) - 30
+    cv2.line(img, (cx, cy), (lx, ly), (255, 100, 100), 6)
+
+    # center marker
+    cv2.circle(img, (cx, cy), 6, (255, 255, 255), -1)
+
+    # throttle/brake bars on right
+    bar_x = 240
+    bar_w = 28
+    bar_h_max = H - 60
+    # throttle
+    th_h = int(bar_h_max * float(throttle))
+    cv2.rectangle(img, (bar_x, 30), (bar_x + bar_w, 30 + bar_h_max), (60, 60, 60), -1)
+    cv2.rectangle(img, (bar_x, 30 + bar_h_max - th_h), (bar_x + bar_w, 30 + bar_h_max), (50, 200, 50), -1)
+    cv2.putText(img, f"Throttle: {throttle:.2f}", (bar_x + bar_w -80, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+    # brake
+    br_x = bar_x + 120
+    br_h = int(bar_h_max * float(brake))
+    cv2.rectangle(img, (br_x, 30), (br_x + bar_w, 30 + bar_h_max), (60, 60, 60), -1)
+    cv2.rectangle(img, (br_x, 30 + bar_h_max - br_h), (br_x + bar_w, 30 + bar_h_max), (200, 50, 50), -1)
+    cv2.putText(img, f"Brake: {brake:.2f}", (br_x + bar_w -60, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+    # Gear and handbrake text
+    gear = 'R' if rev_f >= 0.5 else 'D'
+    cv2.putText(img, f"Gear: {gear}", (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, f"Handbrake: {'ON' if handbrake >= 0.5 else 'OFF'}", (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    # small steer angle readout
+    cv2.putText(img, f"Steer: {steer:.2f}", (40, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    cv2.imshow(win, img)
+    # process window events
+    cv2.waitKey(1)
 def run_loop(args):
     device = torch.device(args.device if args.device is not None else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
@@ -115,6 +177,20 @@ def run_loop(args):
     state = ckpt.get('model_state', ckpt)
     model.load_state_dict(state)
     model.eval()
+
+    # create visualizer if requested (OpenCV-based)
+    vis = None
+    if getattr(args, 'gui', False):
+        try:
+            import cv2
+            # small window
+            W, H = 420, 260
+            win_name = 'Action Visualizer'
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win_name, W, H)
+            vis = dict(cv2=cv2, win_name=win_name, W=W, H=H)
+        except Exception as e:
+            print(f"OpenCV visualizer disabled (import/init error): {e}")
 
     step = 0
     try:
@@ -132,24 +208,25 @@ def run_loop(args):
                 mean, logvar, _ = model(imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t)
 
             mean = mean.squeeze(0).cpu().numpy()  # (5,)
-            # mean[0:2] in [0,1], mean[2] in [-2,2], mean[3:5] in [0,1]
 
-            #if (step < 1000): throttle = 1.0  # warmup period
-            #else: 
             if (step < 100): throttle = 0.5
             else: throttle = float(np.clip(mean[0], 0.0, 1.0))
-            brake = 0
-            #brake = float(np.clip(mean[1], 0.0, 1.0))
-            steer = float(mean[2])  
-            
+            brake = float(np.clip(mean[1], 0.0, 1.0))
+            steer = float(mean[2])
+
             rev_toggle = bool(mean[3] >= 0.5)
             handbrake = bool(mean[4] >= 0.5)
-            
-            if (rev_toggle): 
+
+            if (rev_toggle):
                 print("TOGGLED GEAR")
             action = [throttle, brake, steer, float(rev_toggle), float(handbrake)]
-            
-            #print(f"Step {step}: action = {action}")
+
+            if vis is not None:
+                try:
+                    _update_visualizer_cv(vis, action)
+                except Exception as e:
+                    print(f"Visualizer error: {e}")
+
             next_obs, reward, terminated, truncated = env.step(action)
 
             obs = next_obs
@@ -167,6 +244,12 @@ def run_loop(args):
         print("Keyboard interrupt, shutting down")
     finally:
         env.destroy()
+        if vis is not None:
+            try:
+                if 'cv2' in vis and 'win_name' in vis:
+                    vis['cv2'].destroyAllWindows()
+            except Exception:
+                pass
 
 
 def main():
@@ -178,6 +261,7 @@ def main():
     parser.add_argument('--max_steps', type=int, default=10000)
     parser.add_argument('--stats', type=str, default=None, help='Optional path to .norm_stats.json used for vel/accel normalization')
     parser.add_argument('--phase', type=int, default=1, help='Env phase (collision penalties)')
+    parser.add_argument('--gui', action='store_true', help='Enable action visualizer GUI (OpenCV)')
     args = parser.parse_args()
 
     run_loop(args)
