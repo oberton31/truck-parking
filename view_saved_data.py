@@ -43,7 +43,7 @@ def try_import_pil():
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--npz_path", help="Path to the .npz chunk file", default="/home/snaak/CARLA_with_obstacles/PythonAPI/examples/truck-parking/data/20251116-135901/episode_001/chunk_0109.npz")
+    p.add_argument("--npz_path", help="Path to the .npz chunk file", default="/home/snaak/CARLA_with_obstacles/PythonAPI/examples/truck-parking/data/20251119-120835/episode_004/chunk_0102.npz")
     p.add_argument("--out", default="preview_images", help="Output directory to save preview PNGs")
     p.add_argument("--num-frames", type=int, default=3, help="Number of time-steps to preview (per camera)")
     p.add_argument("--display", action="store_true", help="Attempt to display the first frame using matplotlib")
@@ -86,6 +86,9 @@ def main():
             print(f"  {k}: error getting info: {e}")
 
     images = None
+
+    for k in npz['frames'][0].keys():
+        print(f"Key: {k}, Value: {npz['frames'][0][k]}")
 
     # Prefer explicit 'images' key
     if 'images' in npz.files:

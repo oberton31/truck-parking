@@ -24,7 +24,7 @@ import math
 SHOW_PREVIEW = False
 IM_WIDTH = 640
 IM_HEIGHT = 480
-RENDER_CARLA = False # SET TO FALSE FOR TRAINING
+RENDER_CARLA = True # SET TO FALSE FOR TRAINING
 
 class TruckEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -151,6 +151,7 @@ class TruckEnv:
 
         trailer_angle = pos.rotation.yaw - pos_trailer.rotation.yaw # right hand rule from cab to trailer
         vel = self.player.get_velocity()
+        accel = self.player.get_acceleration()
 
         collision_blueprint = self.world.get_blueprint_library().find('sensor.other.collision')
         self.player_collision_sensor = self.world.spawn_actor(collision_blueprint, carla.Transform(), attach_to=self.player)
@@ -171,11 +172,13 @@ class TruckEnv:
 
         pos_list = [pos.location.x, pos.location.y, pos.location.z, pos.rotation.pitch, pos.rotation.yaw, pos.rotation.roll]
         vel_list = [vel.x, vel.y, vel.z]
+        accel_list = [accel.x, accel.y, accel.z]
 
         reverse = False
 
+        goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
 
-        return (self.image_list, pos_list, vel_list, trailer_angle, reverse, self.goal_pos) # TODO: talk about this some more
+        return (self.image_list, pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list) # consistent with step()
 
     def step(self, action):
         # TODO: Discuss action space
@@ -265,12 +268,15 @@ class TruckEnv:
         elif trailer_angle < -180: trailer_angle += 360
 
         vel = self.player.get_velocity()
+        accel = self.player.get_acceleration()
 
         pos_list = [pos.location.x, pos.location.y, pos.location.z, pos.rotation.pitch, pos.rotation.yaw, pos.rotation.roll]
-        vel_list = [vel.x, vel.y, vel.z]
-        #print(vel_list)
 
-        obs = (self.image_list, pos_list, vel_list, trailer_angle, self.control.reverse, self.goal_pos)
+        vel_list = [vel.x, vel.y, vel.z]
+        accel_list = [accel.x, accel.y, accel.z]
+        goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
+
+        obs = (self.image_list, pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
 
         if RENDER_CARLA and self.curr_steps % 100 == 0:
             print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw: {pos.rotation.yaw:.2f}, Yaw Diff: {yaw_diff:.2f}, Trailer Angle: {trailer_angle:.2f}, Collision: {collision}")
@@ -280,7 +286,6 @@ class TruckEnv:
 
     # Need to tune these
     def _at_goal(self, pos_tol=1.5, angle_tol=5, trailer_tol=8, vel_tol = 0.0001):
-    # def _at_goal(self, pos_tol=1.0, angle_tol=0.1, trailer_tol=15.0, vel_tol = 0.1):
         # pos euclidian distance (going to ignore z)
         player_pos = self.player.get_transform()
         pos_dist = np.sqrt((self.goal_pos.location.x - player_pos.location.x)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
