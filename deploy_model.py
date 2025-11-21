@@ -209,16 +209,18 @@ def run_loop(args):
 
             mean = mean.squeeze(0).cpu().numpy()  # (5,)
 
-            if (step < 100): throttle = 0.5
+            if (step < 100): throttle = 1
             else: throttle = float(np.clip(mean[0], 0.0, 1.0))
             brake = float(np.clip(mean[1], 0.0, 1.0))
+            if (brake < 0.1): brake = 0.0
             steer = float(mean[2])
 
+            print(mean[3])
             rev_toggle = bool(mean[3] >= 0.5)
             handbrake = bool(mean[4] >= 0.5)
 
-            if (rev_toggle):
-                print("TOGGLED GEAR")
+            # if (rev_toggle):
+            #     print("TOGGLED GEAR")
             action = [throttle, brake, steer, float(rev_toggle), float(handbrake)]
 
             if vis is not None:

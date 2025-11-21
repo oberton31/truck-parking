@@ -190,8 +190,7 @@ class TruckEnv:
         self.control.brake = action[1]
         self.control.throttle = action[0]
 
-        if (bool(action[3])):
-            self.control.reverse = not self.control.reverse
+        self.control.reverse = bool(action[3]) # action is now 1 if reverse, 0 otherwise
 
         self.control.hand_brake = bool(action[4])
 

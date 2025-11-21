@@ -523,7 +523,11 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
         bin_prob = torch.clamp(bin_prob, min=1e-6, max=1.0 - 1e-6)
 
         cont_target = actions[:, :3]
+
         bin_target = actions[:, 3:]
+        #print("revs shape:", revs.shape)
+        #print(bin_target[:, 0].shape)
+        bin_target[:, 0] = revs[:, 0] # set reverse action to be a 1 or a 0 based on the rev flag (no longer based on toggle)
 
         normal = torch.distributions.Normal(cont_mean, cont_std)
         logp_cont = normal.log_prob(cont_target)
@@ -603,6 +607,7 @@ def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0
 
             cont_target = actions[:, :3]
             bin_target = actions[:, 3:]
+            bin_target[:, 0] = revs[:, 0]
 
             normal = torch.distributions.Normal(cont_mean, cont_std)
             logp_cont = normal.log_prob(cont_target).sum(dim=1)
@@ -647,6 +652,7 @@ def main():
     parser.add_argument('--pretrained', action='store_true', help='use imagenet pretrained resnet')
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--log_dir', type=str, default='runs', help='tensorboard log directory')
+    parser.add_argument('--checkpoint', type=str, default=None, help='path to model checkpoint to resume from')
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -696,7 +702,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = TruckNet(pretrained=args.pretrained).to(device)
-
+    if args.checkpoint is not None:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        state = ckpt.get('model_state', ckpt)
+        model.load_state_dict(state)
+        
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     best_val = float('inf')
