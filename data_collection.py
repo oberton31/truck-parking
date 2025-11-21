@@ -178,29 +178,25 @@ if __name__ == "__main__":
 
             next_obs, reward, terminated, truncated = env.step(action)
 
+
             buffer.append(dict(
                 images=np.stack(state[0], axis=0),
                 pos=np.array(state[1], dtype=np.float32),
                 vel=np.array(state[2], dtype=np.float32),
-                trailer_angle=np.array(state[3], dtype=np.float32),
-                goal=np.array(state[4], dtype=np.float32),
-
+                accel=np.array(state[3], dtype=np.float32),
+                trailer_angle=np.array(state[4], dtype=np.float32),
+                reverse = np.array(state[5], dtype=np.float32),
+                goal=np.array(state[6], dtype=np.float32),
+                
                 actions=np.array(action, dtype=np.float32),
                 reward=np.array(reward, dtype=np.float32),
                 done=np.array(terminated or truncated, dtype=np.uint8),
                 timestamp=np.array(time.time(), dtype=np.float64),
-
-                # next_images=np.stack(next_obs[0], axis=0),
-                # next_pos=np.array(next_obs[1], dtype=np.float32),
-                # next_vel=np.array(next_obs[2], dtype=np.float32),
-                # next_trailer_angle=np.array(next_obs[3], dtype=np.float32),
-                # next_goal=np.array(next_obs[4], dtype=np.float32),
             ))
 
             if len(buffer) >= CHUNK_SIZE or terminated or truncated:
                 save_path = os.path.join(episode_dir, f"chunk_{chunk_idx:04d}.npz")
                 saver.save(save_path, {"frames": buffer})
-                # delete buffer contents from memory
                 buffer = []
                 chunk_idx += 1
 
