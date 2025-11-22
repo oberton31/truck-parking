@@ -114,7 +114,7 @@ def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu', map_loca
 
     vel_t = (torch.from_numpy(vel).unsqueeze(0) - vel_mean) / vel_std
     accel_t = (torch.from_numpy(accel).unsqueeze(0) - accel_mean) / accel_std
-
+    #print(trailer_angle)
     trailer_t = torch.tensor([[float(trailer_angle)]], dtype=torch.float32) / 180.0
     rev_t = torch.tensor([[1.0 if reverse_flag else 0.0]], dtype=torch.float32)
 
@@ -187,7 +187,7 @@ def run_loop(args):
     world = client.load_world('Town10HD')
     envs = [TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=0, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=1, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=3, world=world)]
     #env = TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2)
-    obs_env = [None] * 4
+    obs_env = [None] * len(envs)
     for i, env in enumerate(envs):
         obs_env[i] = env.reset()
 
@@ -219,7 +219,6 @@ def run_loop(args):
             for i, env in enumerate(envs):
                 obs = obs_env[i]
                 imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t = frame_to_model_inputs(obs, args.img_size, args.stats, device=device, map_location=i)
-
                 imgs = imgs.to(device)
                 pos_rel = pos_rel.to(device)
                 vel_t = vel_t.to(device)
@@ -238,12 +237,12 @@ def run_loop(args):
                 if (brake < 0.1): brake = 0.0
                 steer = float(mean[2])
 
-                rev_toggle = bool(mean[3] >= 0.5)
-                handbrake = bool(mean[4] >= 0.5)
+                # rev_toggle = bool(mean[3] >= 0.5)
+                # handbrake = bool(mean[4] >= 0.5)
 
                 # if (rev_toggle):
                 #     print("TOGGLED GEAR")
-                action = [throttle, brake, steer, float(rev_toggle), float(handbrake)]
+                action = [throttle, brake, steer, mean[3], mean[4]]
 
                 if vis is not None:
                     try:
@@ -251,8 +250,12 @@ def run_loop(args):
                     except Exception as e:
                         print(f"Visualizer error: {e}")
 
-                next_obs, reward, terminated, truncated = env.step(action)
+                env.apply_control(action)
+            
+            envs[0].world.tick()  # advance the shared world once per step
 
+            for i, env in enumerate(envs):
+                next_obs, reward, terminated, truncated = env.get_observation()
                 obs_env[i] = next_obs
 
                 if terminated or truncated:
@@ -260,7 +263,7 @@ def run_loop(args):
                     obs_env[i] = env.reset()
 
             step += 1
-            print(f"Step {step} completed")
+            #print(f"Step {step} completed")
             if args.max_steps is not None and step >= args.max_steps:
                 print("Reached max steps, exiting")
                 break

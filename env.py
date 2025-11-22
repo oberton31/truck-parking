@@ -190,10 +190,7 @@ class TruckEnv:
 
         return (self.image_list, pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list) # consistent with step()
 
-    def step(self, action):
-        # TODO: Discuss action space
-        # For now, discrete action space that mirror the manual control
-        # 0: throttle, 1: brake, 2: steering command, 3: reverse toggle, 4: handbrake toggle
+    def apply_control(self, action):
         self.curr_steps += 1
         self.control.steer = float(action[2])
         self.control.brake = float(action[1])
@@ -203,11 +200,17 @@ class TruckEnv:
 
         self.control.hand_brake = bool(action[4] > 0.5)
 
-        self.player.apply_control(self.control)
+    def step(self, action):
+        # TODO: Discuss action space
+        # For now, discrete action space that mirror the manual control
+        # 0: throttle, 1: brake, 2: steering command, 3: reverse toggle, 4: handbrake toggle
+        self.apply_control(action)
 
         # advance env
         self.world.tick()
+        return self.get_observation()
 
+    def get_observation(self):
         reward = 0
         terminated = False
         truncated = False
@@ -230,7 +233,8 @@ class TruckEnv:
         
         # dense rewards for distance, orientation, trailer angle
         player_pos = self.player.get_transform()
-        dist_to_goal = math.sqrt((self.goal_pos.location.x - player_pos.location.x)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
+        x_dist = self.goal_pos.location.x + 11000 * self.map_location / 100 - player_pos.location.x
+        dist_to_goal = math.sqrt((x_dist)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
         reward += min(0, -dist_to_goal / 200) # should roughly be between 0 and -0.2 (max values of dist are around 40)
 
         player_yaw = player_pos.rotation.yaw % 360
@@ -297,7 +301,8 @@ class TruckEnv:
     def _at_goal(self, pos_tol=1.5, angle_tol=5, trailer_tol=8, vel_tol = 0.0001):
         # pos euclidian distance (going to ignore z)
         player_pos = self.player.get_transform()
-        pos_dist = np.sqrt((self.goal_pos.location.x - player_pos.location.x)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
+        x_dist = self.goal_pos.location.x + 11000 * self.map_location / 100 - player_pos.location.x
+        pos_dist = np.sqrt((x_dist)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
         
         # only care about yaw
         player_yaw = player_pos.rotation.yaw % 360

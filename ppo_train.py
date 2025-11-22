@@ -350,12 +350,21 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
     episode = 0
     best_reward = -float('inf')
     evaluate = True
-    for step in tqdm.tqdm(range(max_training_steps)):
+    
+    pbar = tqdm.tqdm(range(max_training_steps), dynamic_ncols=True)
+
+    running_rewards = []
+    running_values = []
+
+    for step in pbar:        
         actions = []
+        values_this_step = []
 
         for obs in obs_list:
-            action, _, _ = ppo.act(obs)
+            action, _, value = ppo.act(obs)
             actions.append(action)
+            values_this_step.append(value.item())
+
 
         # env.step expects list-of-4 actions
         next_obs = []
@@ -364,7 +373,11 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
         next_truncated = []
 
         for i in range(num_agents):
-            o, r, term, trunc = envs[i].step(actions[i].cpu().numpy())
+            envs[i].apply_control(actions[i].cpu().numpy())
+        envs[0].world.tick()
+        
+        for i in range(num_agents):
+            o, r, term, trunc = envs[i].get_observation()
             next_obs.append(frame_to_tensordict(o, img_size, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std))
             next_rewards.append(r)
             next_terminated.append(term)
@@ -384,10 +397,16 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
         # Move to next obs
         obs_list = next_obs
 
-        if step % 10000 == 0:
+        if (step + 1) % 10000 == 0:
             # Perform evaluation
             evaluate = True
-            
+        
+        running_rewards.extend(next_rewards)
+        running_values.extend(values_this_step)
+        avg_reward = np.mean(running_rewards[-100:])  # moving average over last 100 steps
+        avg_value = np.mean(running_values[-100:])
+
+        pbar.set_description(f"Step {step} | Avg Reward {avg_reward:.2f} | Avg Value {avg_value:.2f}")
 
         # Rollout complete → update PPO
         if ppo.ptr >= ppo.rollout_steps:
@@ -401,8 +420,11 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
             obs_list = [None] * num_agents
             if evaluate:
                 evaluate = False
+                print("Evaluating...")
                 avg_reward = ppo.evaluate(evaluate_steps=5000, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, env = envs[np.random.randint(num_agents)])
                 print(f"[EVAL] episode={episode} steps={step} avg_reward={avg_reward:.3f}")
+                torch.save({'model_state': ppo.policy.state_dict()},
+                    f"checkpoints/ppo_{episode}.pt")
                 if (avg_reward > best_reward):
                     best_reward = avg_reward
                     torch.save({'model_state': ppo.policy.state_dict()},
@@ -432,10 +454,10 @@ if __name__ == "__main__":
     max_steps = 2000
     num_agents = 4
 
-    envs = [TruckEnv(max_steps=max_steps, world=world, phase=0, map_location=i) for i in range(num_agents)]
+    envs = [TruckEnv(max_steps=max_steps, world=world, phase=1, map_location=i) for i in range(num_agents)]
     ppo = PPOMultiAgent(
         device=device,
-        checkpoint_filepath="checkpoints/bc_epoch_005.pt",
+        checkpoint_filepath="checkpoints/bc_epoch_013.pt",
         num_agents=num_agents
     )
 
