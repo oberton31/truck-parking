@@ -2,6 +2,8 @@ import torch.nn as nn
 import torch
 import torchvision.models as models
 import math
+from torchvision.models import ResNet18_Weights
+
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_hidden_layers=2):
@@ -20,7 +22,10 @@ class TruckNet(nn.Module):
     def __init__(self, pretrained=True, num_cams=4, mlp_hidden=512, out_dim=5, pos_dim=3, vel_dim=2, accel_dim=2, trailer_angle_dim=1, rev_dim=1, state_embed=128):
 
         super().__init__()
-        base = models.resnet18(pretrained=pretrained)
+        if pretrained:
+                base = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+        else:
+            base = models.resnet18(weights=None)
         feat_dim = base.fc.in_features
 
         # remove final fc

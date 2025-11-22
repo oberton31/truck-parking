@@ -24,7 +24,7 @@ import math
 SHOW_PREVIEW = False
 IM_WIDTH = 640
 IM_HEIGHT = 480
-RENDER_CARLA = True # SET TO FALSE FOR TRAINING
+RENDER_CARLA = False # SET TO FALSE FOR TRAINING
 
 class TruckEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -35,10 +35,13 @@ class TruckEnv:
     # Phase 0: no additional vehicles, but penalized if collides with building or itself
     # Phase 1: add other vehicles but minor penalty for collisions
     # Phase 3: full penalties for collisions, and episode terminates
-    def __init__(self, max_steps=10000, goal_idx=None, phase=1):
-        self.client = carla.Client('localhost', 2000)
-        self.client.set_timeout(20.0)
-        self.world = self.client.load_world('Town10HD')
+    def __init__(self, max_steps=10000, goal_idx=None, phase=1, map_location=0, world=None):
+        if world is None:
+            self.client = carla.Client('localhost', 2000)
+            self.client.set_timeout(20.0)
+            self.world = self.client.load_world('Town10HD')
+        else:
+            self.world = world
 
         # Taken from example file
         self.player_max_speed = 1.589
@@ -95,21 +98,25 @@ class TruckEnv:
         self.spawn_bounds = [-65, 157, -40, 188]  # x_min, y_min, x_max, y_max
         self.collision = False
         self.phase = phase
+        self.map_location = map_location
 
     def reset(self):
         # TODO: define spawn point and goal point
-        print("Resetting Env")
+        if RENDER_CARLA:
+            print("Resetting Env")
         self.curr_steps = 0
         self.destroy()
 
 
         if (self.goal_idx is not None):
             self.goal_pos = self.goal_points[self.goal_idx][0]
-            print(f"Using provided goal: {self.goal_points[self.goal_idx][1]}")
+            if RENDER_CARLA:
+                print(f"Using provided goal: {self.goal_points[self.goal_idx][1]}")
         else:
             rand_goal = random.choice(self.goal_points)
             self.goal_pos = rand_goal[0]
-            print(f"Using random goal: {rand_goal[1]}")
+            if RENDER_CARLA:
+                print(f"Using random goal: {rand_goal[1]}")
 
         self.actor_list = []
 
@@ -124,7 +131,8 @@ class TruckEnv:
             self.player = None
             self.playerTrailer = None
             spawn_point = carla.Transform()
-            spawn_point.location.x = random.uniform(self.spawn_bounds[0], self.spawn_bounds[2])
+            spawn_point.location.x = random.uniform(self.spawn_bounds[0], self.spawn_bounds[2]) + (11000*self.map_location) / 100
+
             spawn_point.location.y = random.uniform(self.spawn_bounds[1], self.spawn_bounds[3])
             spawn_point.location.z = 1.0
             spawn_point.rotation.yaw = random.uniform(-180, 180)
@@ -137,7 +145,8 @@ class TruckEnv:
             self.player = self.world.try_spawn_actor(self.blueprint, spawn_point) 
             self.world.tick()
 
-        print(f"Spawned Truck and Trailer at ({self.player.get_transform().location.x:.2f}, {self.player.get_transform().location.y:.2f})")
+        if RENDER_CARLA:
+            print(f"Spawned Truck and Trailer at ({self.player.get_transform().location.x:.2f}, {self.player.get_transform().location.y:.2f})")
         self.actor_list.append(self.playerTrailer)
         self.actor_list.append(self.player)
 
@@ -177,6 +186,7 @@ class TruckEnv:
         reverse = False
 
         goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
+        goal_list[0] += (11000*self.map_location) / 100
 
         return (self.image_list, pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list) # consistent with step()
 
@@ -185,14 +195,13 @@ class TruckEnv:
         # For now, discrete action space that mirror the manual control
         # 0: throttle, 1: brake, 2: steering command, 3: reverse toggle, 4: handbrake toggle
         self.curr_steps += 1
+        self.control.steer = float(action[2])
+        self.control.brake = float(action[1])
+        self.control.throttle = float(action[0])
 
-        self.control.steer = action[2]
-        self.control.brake = action[1]
-        self.control.throttle = action[0]
+        self.control.reverse = bool(action[3] > 0.5) # action is now 1 if reverse, 0 otherwise
 
-        self.control.reverse = bool(action[3]) # action is now 1 if reverse, 0 otherwise
-
-        self.control.hand_brake = bool(action[4])
+        self.control.hand_brake = bool(action[4] > 0.5)
 
         self.player.apply_control(self.control)
 
@@ -274,6 +283,7 @@ class TruckEnv:
         vel_list = [vel.x, vel.y, vel.z]
         accel_list = [accel.x, accel.y, accel.z]
         goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
+        goal_list[0] += (11000*self.map_location) / 100
 
         obs = (self.image_list, pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
 
@@ -409,7 +419,8 @@ class TruckEnv:
             return []
 
     def destroy(self):
-        print("Destroying actors...")
+        if RENDER_CARLA:
+            print("Destroying actors...")
         for actor in self.actor_list:
             try:
                 # Stop sensors if they are listening

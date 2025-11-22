@@ -19,6 +19,20 @@ Usage:
   python deploy_model.py --checkpoint checkpoints/best.pt --max_steps 2000 --save_dir collected_by_model
 
 """
+from __future__ import print_function
+
+import glob
+import os
+import sys
+try:
+    sys.path.append(glob.glob('../../carla/dist/carla-*%d.%d-%s.egg' % (
+        sys.version_info.major,
+        sys.version_info.minor,
+        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
+except IndexError:
+    pass
+
+import carla
 import argparse
 import json
 import os
@@ -47,7 +61,7 @@ def make_transform(img_size):
     ])
 
 
-def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu'):
+def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu', map_location=0):
     """
     Convert env observation to model inputs.
 
@@ -69,7 +83,9 @@ def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu'):
         a = np.array(arr, dtype=np.float32).ravel()
         out = [float(a[i]) if i < a.size else 0.0 for i in indices]
         return np.array(out, dtype=np.float32)
-
+    
+    pos_list[0] -= map_location * 11000 / 100
+    goal_list[0] -= map_location * 11000 / 100  # adjust x pos based on map location
     pos = sel_list(pos_list, [0, 1, 4])
     vel = sel_list(vel_list, [0, 1])
     accel = sel_list(accel_list, [0, 1])
@@ -166,9 +182,14 @@ def _update_visualizer_cv(vis, action):
     cv2.waitKey(1)
 def run_loop(args):
     device = torch.device(args.device if args.device is not None else ('cuda' if torch.cuda.is_available() else 'cpu'))
-
-    env = TruckEnv(max_steps=args.max_steps, phase=args.phase)
-    obs = env.reset()
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(20.0)
+    world = client.load_world('Town10HD')
+    envs = [TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=0, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=1, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=3, world=world)]
+    #env = TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2)
+    obs_env = [None] * 4
+    for i, env in enumerate(envs):
+        obs_env[i] = env.reset()
 
     model = TruckNet(pretrained=args.pretrained)
     model.to(device)
@@ -195,49 +216,51 @@ def run_loop(args):
     step = 0
     try:
         while True:
-            imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t = frame_to_model_inputs(obs, args.img_size, args.stats, device=device)
+            for i, env in enumerate(envs):
+                obs = obs_env[i]
+                imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t = frame_to_model_inputs(obs, args.img_size, args.stats, device=device, map_location=i)
 
-            imgs = imgs.to(device)
-            pos_rel = pos_rel.to(device)
-            vel_t = vel_t.to(device)
-            accel_t = accel_t.to(device)
-            trailer_t = trailer_t.to(device)
-            rev_t = rev_t.to(device)
+                imgs = imgs.to(device)
+                pos_rel = pos_rel.to(device)
+                vel_t = vel_t.to(device)
+                accel_t = accel_t.to(device)
+                trailer_t = trailer_t.to(device)
+                rev_t = rev_t.to(device)
 
-            with torch.no_grad():
-                mean, logvar, _ = model(imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t)
+                with torch.no_grad():
+                    mean, logvar, _ = model(imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t)
 
-            mean = mean.squeeze(0).cpu().numpy()  # (5,)
+                mean = mean.squeeze(0).cpu().numpy()  # (5,)
 
-            if (step < 100): throttle = 1
-            else: throttle = float(np.clip(mean[0], 0.0, 1.0))
-            brake = float(np.clip(mean[1], 0.0, 1.0))
-            if (brake < 0.1): brake = 0.0
-            steer = float(mean[2])
+                if (step < 100): throttle = 1
+                else: throttle = float(np.clip(mean[0], 0.0, 1.0))
+                brake = float(np.clip(mean[1], 0.0, 1.0))
+                if (brake < 0.1): brake = 0.0
+                steer = float(mean[2])
 
-            print(mean[3])
-            rev_toggle = bool(mean[3] >= 0.5)
-            handbrake = bool(mean[4] >= 0.5)
+                rev_toggle = bool(mean[3] >= 0.5)
+                handbrake = bool(mean[4] >= 0.5)
 
-            # if (rev_toggle):
-            #     print("TOGGLED GEAR")
-            action = [throttle, brake, steer, float(rev_toggle), float(handbrake)]
+                # if (rev_toggle):
+                #     print("TOGGLED GEAR")
+                action = [throttle, brake, steer, float(rev_toggle), float(handbrake)]
 
-            if vis is not None:
-                try:
-                    _update_visualizer_cv(vis, action)
-                except Exception as e:
-                    print(f"Visualizer error: {e}")
+                if vis is not None:
+                    try:
+                        _update_visualizer_cv(vis, action)
+                    except Exception as e:
+                        print(f"Visualizer error: {e}")
 
-            next_obs, reward, terminated, truncated = env.step(action)
+                next_obs, reward, terminated, truncated = env.step(action)
 
-            obs = next_obs
+                obs_env[i] = next_obs
+
+                if terminated or truncated:
+                    print("Episode finished, resetting env")
+                    obs_env[i] = env.reset()
+
             step += 1
-
-            if terminated or truncated:
-                print("Episode finished, resetting env")
-                obs = env.reset()
-
+            print(f"Step {step} completed")
             if args.max_steps is not None and step >= args.max_steps:
                 print("Reached max steps, exiting")
                 break
@@ -245,7 +268,8 @@ def run_loop(args):
     except KeyboardInterrupt:
         print("Keyboard interrupt, shutting down")
     finally:
-        env.destroy()
+        for env in envs:
+            env.destroy()
         if vis is not None:
             try:
                 if 'cv2' in vis and 'win_name' in vis:
