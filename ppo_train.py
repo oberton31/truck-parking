@@ -31,9 +31,6 @@ class PPOAgent:
         self.minibatch_size = minibatch_size
         self.rollout_steps = rollout_steps
 
-        self.buffer = ReplayBuffer(storage=LazyTensorStorage(10000), sampler=SamplerWithoutReplacement()) # TODO: gonna need to really look at this
-        self.current_rollout_buffer = ReplayBuffer(storage=LazyTensorStorage(10000), sampler=SamplerWithoutReplacement())
-        self.steps_collected_with_curr_policy = 0
         '''
         Example of how to use buffer:
         transition = TensorDict({
