@@ -6,6 +6,8 @@ import glob
 import os
 import sys
 
+#from scipy import rand
+
 try:
     sys.path.append(glob.glob('../../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
@@ -35,7 +37,7 @@ class TruckEnv:
     # Phase 0: no additional vehicles, but penalized if collides with building or itself
     # Phase 1: add other vehicles but minor penalty for collisions
     # Phase 3: full penalties for collisions, and episode terminates
-    def __init__(self, max_steps=10000, goal_idx=None, phase=1, map_location=0, world=None):
+    def __init__(self, max_steps=10000, goal_idx=None, phase=1, map_location=0, world=None, use_cameras=True):
         if world is None:
             self.client = carla.Client('localhost', 2000)
             self.client.set_timeout(20.0)
@@ -72,11 +74,10 @@ class TruckEnv:
         self.image_list = []
 
         self.control = carla.VehicleControl()
-        self.steer_cache = 0.0 # stores the prior steering values
         self.max_steps = max_steps
         self.curr_steps = 0
 
-        self.action_ndim = 5 # If change action space, need to change this
+        self.action_ndim = 3 # If change action space, need to change this
 
         settings = self.world.get_settings()
         settings.synchronous_mode = True
@@ -87,11 +88,11 @@ class TruckEnv:
         self.goal_pos = None
 
         self.goal_points = [
-            (carla.Transform(carla.Location(-43.5, 188.5, 0.06), carla.Rotation(0, -90, 0)), "Bottom Right"),
-            (carla.Transform(carla.Location(-54, 188.5, 0.06), carla.Rotation(0, -90, 0)), "Bottom Center"),
-            (carla.Transform(carla.Location(-63.5, 188.5, 0.06), carla.Rotation(0, -90, 0)), "Bottom Left"),
-            (carla.Transform(carla.Location(-43.5, 182.5, 0.06), carla.Rotation(0, -180, 0)), "Right Top"),
-            (carla.Transform(carla.Location(-43.5, 192.5, 0.06), carla.Rotation(0, -180, 0)), "Right Bottom")
+            (carla.Transform(carla.Location(-43.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Right"),
+            (carla.Transform(carla.Location(-54, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Center"),
+            (carla.Transform(carla.Location(-63.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Left"),
+            (carla.Transform(carla.Location(-43.5, 182.5, 1), carla.Rotation(0, -180, 0)), "Right Top"),
+            (carla.Transform(carla.Location(-43.5, 192.5, 1), carla.Rotation(0, -180, 0)), "Right Bottom")
         ]
 
         self.goal_idx = goal_idx
@@ -100,14 +101,19 @@ class TruckEnv:
         self.phase = phase
         self.map_location = map_location
 
+        self.use_cameras = use_cameras
+        self.last_dist_to_goal = None
+        self.last_yaw_diff = None
+        self.last_trailer_angle = None
+
+
     def reset(self):
-        # TODO: define spawn point and goal point
         if RENDER_CARLA:
             print("Resetting Env")
         self.curr_steps = 0
         self.destroy()
 
-
+        rand_goal_name = None
         if (self.goal_idx is not None):
             self.goal_pos = self.goal_points[self.goal_idx][0]
             if RENDER_CARLA:
@@ -115,8 +121,9 @@ class TruckEnv:
         else:
             rand_goal = random.choice(self.goal_points)
             self.goal_pos = rand_goal[0]
+            rand_goal_name = rand_goal[1]
             if RENDER_CARLA:
-                print(f"Using random goal: {rand_goal[1]}")
+                print(f"Using random goal: {rand_goal_name}")
 
         self.actor_list = []
 
@@ -127,22 +134,40 @@ class TruckEnv:
                 self.player.destroy()
             if self.playerTrailer is not None:
                 self.playerTrailer.destroy()
+
             self.world.tick()
             self.player = None
             self.playerTrailer = None
-            spawn_point = carla.Transform()
-            spawn_point.location.x = random.uniform(self.spawn_bounds[0], self.spawn_bounds[2]) + (11000*self.map_location) / 100
 
-            spawn_point.location.y = random.uniform(self.spawn_bounds[1], self.spawn_bounds[3])
-            spawn_point.location.z = 1.0
-            spawn_point.rotation.yaw = random.uniform(-180, 180)
+            # Pick a goal point
+            orig = self.goal_pos
+            #orig = rand_point[0]
 
+            # ---- FIX: clone transform so we don’t mutate goal_points ----
+            spawn_point = carla.Transform(
+                carla.Location(orig.location.x, orig.location.y, orig.location.z),
+                carla.Rotation(orig.rotation.pitch, orig.rotation.yaw, orig.rotation.roll)
+            )
+            #print(f"Spawn point: ({spawn_point.location.x}, {spawn_point.location.y}, {spawn_point.location.z})")
+            # --------------------------------------------------------------
+
+            # Training regimen: start near the goal
+            if rand_goal_name in ["Bottom Right", "Bottom Center", "Bottom Left"]:
+                spawn_point.location.y -= 5
+            else:
+                spawn_point.location.x -= 5
+
+            spawn_point.location.x += 11000 * self.map_location / 100
+
+            # Try to spawn the trailer
             self.playerTrailer = self.world.try_spawn_actor(self.blueprintTrailer, spawn_point)
 
+            # Move forward and try to spawn the truck
             forwardVector = spawn_point.get_forward_vector() * 5.2
             spawn_point.location += forwardVector
 
-            self.player = self.world.try_spawn_actor(self.blueprint, spawn_point) 
+            self.player = self.world.try_spawn_actor(self.blueprint, spawn_point)
+
             self.world.tick()
 
         if RENDER_CARLA:
@@ -153,7 +178,8 @@ class TruckEnv:
         self.collision = False
 
         # spawn cameras
-        self.rgb_sensors = self._spawn_cameras()
+        if self.use_cameras:
+            self.rgb_sensors = self._spawn_cameras()
 
         pos = self.player.get_transform() # it appears the position for both of these is the same, but the rotation varies
         pos_trailer = self.playerTrailer.get_transform()
@@ -176,8 +202,9 @@ class TruckEnv:
 
         self.player.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
-        while not all(img is not None for img in self.image_list):
-            self.world.tick()
+        if self.use_cameras:
+            while not all(img is not None for img in self.image_list):
+                self.world.tick()
 
         pos_list = [pos.location.x, pos.location.y, pos.location.z, pos.rotation.pitch, pos.rotation.yaw, pos.rotation.roll]
         vel_list = [vel.x, vel.y, vel.z]
@@ -188,22 +215,34 @@ class TruckEnv:
         goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
         goal_list[0] += (11000*self.map_location) / 100
 
-        return (self.image_list, pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list) # consistent with step()
+        if self.use_cameras:
+            return (self.image_list, pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list)
+        else:
+            return (pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list)
 
     def apply_control(self, action):
+        assert(len(action) == self.action_ndim), f"Expected action of length {self.action_ndim}, got {len(action)}"
         self.curr_steps += 1
-        self.control.steer = float(action[2])
-        self.control.brake = float(action[1])
-        self.control.throttle = float(action[0])
 
-        self.control.reverse = bool(action[3] > 0.5) # action is now 1 if reverse, 0 otherwise
+        self.control.steer = float(action[1])
 
-        self.control.hand_brake = bool(action[4] > 0.5)
+        if (float(action[0]) < 0):
+            self.control.brake = -float(action[0])
+            self.control.throttle = 0.0
+        else:
+            self.control.throttle = float(action[0])
+            self.control.brake = 0.0
+
+        self.control.reverse = bool(action[2] > 0.5) # action is now 1 if reverse, 0 otherwise
+
+        self.player.apply_control(self.control)
+
 
     def step(self, action):
         # TODO: Discuss action space
         # For now, discrete action space that mirror the manual control
-        # 0: throttle, 1: brake, 2: steering command, 3: reverse toggle, 4: handbrake toggle
+        # 0: throttle/brake, 1: brake, 2: steering command, 3: reverse toggle, 4: handbrake toggle
+
         self.apply_control(action)
 
         # advance env
@@ -211,31 +250,28 @@ class TruckEnv:
         return self.get_observation()
 
     def get_observation(self):
-        reward = 0
         terminated = False
         truncated = False
 
+        # if self.phase == 0:
+        #     vel_thresh = 1.0
+        # else:
+        #     vel_thresh = 0.01
 
-        if self._at_goal():
-            terminated = True
-            if RENDER_CARLA:
-                print("At Goal!")
-            reward += 15.0
-
-        collision = self.collision
-        if self.collision:
-            if self.phase == 2:
-                terminated = True
-                reward = -1
-            elif self.phase == 1:
-                reward += -0.1
-            self.collision = False # reset collision flag for next step
+        if self.phase != 2:
+            vel_thresh = 0.05
+            pos_thresh = 3
+            trailer_angle_thresh = 15
+            yaw_thresh = 8
+        else:
+            vel_thresh = 0.01
+            pos_thresh = 1.5
+            trailer_angle_thresh = 8
+            yaw_thresh = 5
         
-        # dense rewards for distance, orientation, trailer angle
         player_pos = self.player.get_transform()
         x_dist = self.goal_pos.location.x + 11000 * self.map_location / 100 - player_pos.location.x
-        dist_to_goal = math.sqrt((x_dist)**2 + (self.goal_pos.location.y - player_pos.location.y)**2)
-        reward += min(0, -dist_to_goal / 200) # should roughly be between 0 and -0.2 (max values of dist are around 40)
+        dist_to_goal = math.sqrt((x_dist)**2 + (self.goal_pos.location.y - player_pos.location.y)**2) 
 
         player_yaw = player_pos.rotation.yaw % 360
         if player_yaw > 180: player_yaw -= 360
@@ -248,12 +284,12 @@ class TruckEnv:
         yaw_diff = player_yaw - goal_yaw
         if yaw_diff > 180: yaw_diff -= 360
         elif yaw_diff < -180: yaw_diff += 360
+        yaw_diff = min(abs(yaw_diff), 360 - abs(yaw_diff))  # account for wrap-around
         yaw_diff = abs(yaw_diff)
-        reward += min(0, yaw_diff / 180 / 10) # should be between 0 and -0.1
         trailer_pos = self.playerTrailer.get_transform()
         trailer_angle_error = np.abs(player_pos.rotation.yaw % 360 - trailer_pos.rotation.yaw % 360) # this error should be between 0 and 90
         trailer_angle_error = min(trailer_angle_error, 360 - trailer_angle_error)  # account for wrap-around
-        reward += min(0, -trailer_angle_error / 90 / 10)
+        trailer_angle_error = abs(trailer_angle_error)
 
         if self.curr_steps >= self.max_steps:
             truncated = True        
@@ -279,6 +315,52 @@ class TruckEnv:
         if trailer_angle > 180: trailer_angle -= 360
         elif trailer_angle < -180: trailer_angle += 360
 
+        reward = 0
+        collision = self.collision
+        if self._at_goal(pos_tol=pos_thresh, angle_tol=yaw_thresh, trailer_tol=trailer_angle_thresh, vel_tol=vel_thresh):
+            terminated = True
+            if RENDER_CARLA:
+                print("At Goal!")
+            reward += 100.0
+        
+        if self.collision:
+            if self.phase == 2:
+                reward += -10.0
+            else:
+                reward += -2 # very small penalty collision
+            self.collision = False
+
+        # if trailer_angle_error > 60:
+        #     reward += -2.0
+
+        if self.last_dist_to_goal is None:
+            self.last_dist_to_goal = dist_to_goal
+            self.last_yaw_diff = yaw_diff
+            self.last_trailer_angle = trailer_angle_error
+        
+        delta_dist = self.last_dist_to_goal - dist_to_goal
+        reward += 5 * delta_dist if delta_dist > 0 else 3 * delta_dist  # reward getting closer more than punishing getting further
+        self.last_dist_to_goal = dist_to_goal
+
+        delta_yaw = self.last_yaw_diff - yaw_diff
+        reward += 3  * delta_yaw if delta_yaw > 0 else 1 * delta_yaw  # reward reducing yaw difference more than punishing increasing
+        self.last_yaw_diff = yaw_diff
+
+        delta_trailer_angle = self.last_trailer_angle - trailer_angle_error
+        reward += 3 * delta_trailer_angle if delta_trailer_angle > 0 else 1 * delta_trailer_angle  # reward reducing trailer angle difference more than punishing increasing
+        self.last_trailer_angle = trailer_angle_error
+
+
+        #print(f"Delta Dist Reward: {delta_dist *6:.3f}, Delta Yaw Reward: {delta_yaw *2:.3f}, Delta Trailer Angle Reward: {delta_trailer_angle *1:.3f}")
+        #print(delta_trailer_angle *0.1 + delta_yaw *0.2 + delta_dist *0.6)
+        # if (self.curr_steps % 1000) == 0:
+        #     print(delta_dist *60 + delta_yaw *20 + delta_trailer_angle *10)
+        reward -= 0.005 # step penalty to encourage faster solutions
+
+        # if (self.curr_steps % 1000) == 0:
+        #     print(f"reward: {reward}")
+        #reward = float(max(-10.0, min(30.0, reward)))
+
         vel = self.player.get_velocity()
         accel = self.player.get_acceleration()
 
@@ -289,12 +371,15 @@ class TruckEnv:
         goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
         goal_list[0] += (11000*self.map_location) / 100
 
-        obs = (self.image_list, pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
+        if self.use_cameras:
+            obs = (self.image_list, pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
+        else:
+            obs = (pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
 
         if RENDER_CARLA and self.curr_steps % 100 == 0:
             print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw: {pos.rotation.yaw:.2f}, Yaw Diff: {yaw_diff:.2f}, Trailer Angle: {trailer_angle:.2f}, Collision: {collision}")
 
-        return obs, reward, terminated, truncated # obs, goal, reward, terminated, truncated
+        return obs, reward, terminated, truncated
 
 
     # Need to tune these

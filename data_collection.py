@@ -150,7 +150,7 @@ class PygameController:
 
 
 if __name__ == "__main__":
-    env = TruckEnv(max_steps=1000000)
+    env = TruckEnv(max_steps=1000000, use_cameras=False, map_location=3)
     obs = env.reset()
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     save_dir = os.path.join(SAVE_PATH, timestamp)
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     buffer = []
     chunk_idx = 0
     episode = 0
-
+    reverse = False
     try:
         episode_dir = os.path.join(save_dir, f"episode_{episode:03d}")
         os.makedirs(episode_dir, exist_ok=True)
@@ -174,31 +174,34 @@ if __name__ == "__main__":
             if action is None:
                 print("Quit requested by user")
                 break
-
-
+            if (action[3]):
+                reverse = not reverse
+            
+            action[3] = 1 if reverse else 0
+            #print(f"Action: throttle={action[0]:.3f}, brake={action[1]:.3f}, steer={action[2]:.3f}, reverse={action[3]}, handbrake={action[4]}")
             next_obs, reward, terminated, truncated = env.step(action)
 
 
-            buffer.append(dict(
-                images=np.stack(state[0], axis=0),
-                pos=np.array(state[1], dtype=np.float32),
-                vel=np.array(state[2], dtype=np.float32),
-                accel=np.array(state[3], dtype=np.float32),
-                trailer_angle=np.array(state[4], dtype=np.float32),
-                reverse = np.array(state[5], dtype=np.float32),
-                goal=np.array(state[6], dtype=np.float32),
+            # buffer.append(dict(
+            #     images=np.stack(state[0], axis=0),
+            #     pos=np.array(state[1], dtype=np.float32),
+            #     vel=np.array(state[2], dtype=np.float32),
+            #     accel=np.array(state[3], dtype=np.float32),
+            #     trailer_angle=np.array(state[4], dtype=np.float32),
+            #     reverse = np.array(state[5], dtype=np.float32),
+            #     goal=np.array(state[6], dtype=np.float32),
                 
-                actions=np.array(action, dtype=np.float32),
-                reward=np.array(reward, dtype=np.float32),
-                done=np.array(terminated or truncated, dtype=np.uint8),
-                timestamp=np.array(time.time(), dtype=np.float64),
-            ))
+            #     actions=np.array(action, dtype=np.float32),
+            #     reward=np.array(reward, dtype=np.float32),
+            #     done=np.array(terminated or truncated, dtype=np.uint8),
+            #     timestamp=np.array(time.time(), dtype=np.float64),
+            # ))
 
-            if len(buffer) >= CHUNK_SIZE or terminated or truncated:
-                save_path = os.path.join(episode_dir, f"chunk_{chunk_idx:04d}.npz")
-                saver.save(save_path, {"frames": buffer})
-                buffer = []
-                chunk_idx += 1
+            # if len(buffer) >= CHUNK_SIZE or terminated or truncated:
+            #     save_path = os.path.join(episode_dir, f"chunk_{chunk_idx:04d}.npz")
+            #     saver.save(save_path, {"frames": buffer})
+            #     buffer = []
+            #     chunk_idx += 1
 
             if terminated or truncated:
                 print("Episode finished, resetting env")

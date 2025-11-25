@@ -4,3 +4,5 @@ __pycache__/
 preview_images/
 checkpoints/
 runs/
+logs/
+old_models/

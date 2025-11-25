@@ -24,6 +24,8 @@ from __future__ import print_function
 import glob
 import os
 import sys
+
+from sympy import use
 try:
     sys.path.append(glob.glob('../../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
@@ -68,17 +70,19 @@ def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu', map_loca
     obs is (image_list, pos_list, vel_list, accel_list, trailer_angle, reverse, goal_list)
     Returns tensors: imgs(1,num_cams,3,H,W), pos_rel(1,3), vel(1,2), accel(1,2), trailer(1,1), rev(1,1)
     """
+    #images, pos_list, vel_list, accel_list, trailer_angle, reverse_flag, goal_list = obs
+
     images, pos_list, vel_list, accel_list, trailer_angle, reverse_flag, goal_list = obs
 
-    transform = make_transform(img_size)
-    imgs = []
-    for i in range(len(images)):
-        im = images[i]
-        im_pil = T.functional.to_pil_image(im)
-        imgs.append(transform(im_pil))
-    imgs = torch.stack(imgs, dim=0).unsqueeze(0)  # (1, num_cams, 3, H, W)
+    # transform = make_transform(img_size)
+    # imgs = []
+    # for i in range(len(images)):
+    #     im = images[i]
+    #     im_pil = T.functional.to_pil_image(im)
+    #     imgs.append(transform(im_pil))
+    # imgs = torch.stack(imgs, dim=0).unsqueeze(0)  # (1, num_cams, 3, H, W)
 
-    # select indices used in dataset: pos [0,1,4], vel [0,1], accel [0,1], goal [0,1,4]
+    # # select indices used in dataset: pos [0,1,4], vel [0,1], accel [0,1], goal [0,1,4]
     def sel_list(arr, indices):
         a = np.array(arr, dtype=np.float32).ravel()
         out = [float(a[i]) if i < a.size else 0.0 for i in indices]
@@ -118,7 +122,8 @@ def frame_to_model_inputs(obs, img_size, stats_path=None, device='cpu', map_loca
     trailer_t = torch.tensor([[float(trailer_angle)]], dtype=torch.float32) / 180.0
     rev_t = torch.tensor([[1.0 if reverse_flag else 0.0]], dtype=torch.float32)
 
-    return imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t
+    # return imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t
+    return pos_rel, vel_t, accel_t, trailer_t, rev_t
 
 
 def _update_visualizer_cv(vis, action):
@@ -130,7 +135,10 @@ def _update_visualizer_cv(vis, action):
     win = vis['win_name']
     W, H = vis['W'], vis['H']
 
-    throttle, brake, steer, rev_f, handbrake = action
+    throttle, steer, rev_f = action
+    brake = -throttle if throttle < 0 else 0.0
+    throttle = throttle if throttle > 0 else 0.0
+    handbrake = 0.0
 
     # background
     img = np.zeros((H, W, 3), dtype=np.uint8)
@@ -185,13 +193,13 @@ def run_loop(args):
     client = carla.Client('localhost', 2000)
     client.set_timeout(20.0)
     world = client.load_world('Town10HD')
-    envs = [TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=0, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=1, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2, world=world), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=3, world=world)]
+    envs = [TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=0, world=None, use_cameras=True)]#, TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=1, world=world, use_cameras=False), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2, world=world, use_cameras=False), TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=3, world=world, use_cameras=False)]
     #env = TruckEnv(max_steps=args.max_steps, phase=args.phase, map_location=2)
     obs_env = [None] * len(envs)
     for i, env in enumerate(envs):
         obs_env[i] = env.reset()
 
-    model = TruckNet(pretrained=args.pretrained)
+    model = TruckNet(pretrained=args.pretrained, use_images=False)
     model.to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device)
@@ -214,54 +222,64 @@ def run_loop(args):
             print(f"OpenCV visualizer disabled (import/init error): {e}")
 
     step = 0
+    env = envs[0]
     try:
         while True:
-            for i, env in enumerate(envs):
-                obs = obs_env[i]
-                imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t = frame_to_model_inputs(obs, args.img_size, args.stats, device=device, map_location=i)
-                imgs = imgs.to(device)
-                pos_rel = pos_rel.to(device)
-                vel_t = vel_t.to(device)
-                accel_t = accel_t.to(device)
-                trailer_t = trailer_t.to(device)
-                rev_t = rev_t.to(device)
+            # for i, env in enumerate(envs):
+            obs = obs_env[0]
+            # imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t = frame_to_model_inputs(obs, args.img_size, args.stats, device=device, map_location=i)
+            pos_rel, vel_t, accel_t, trailer_t, rev_t = frame_to_model_inputs(obs, args.img_size, args.stats, device=device, map_location=i)
+            # imgs = imgs.to(device)
+            pos_rel = pos_rel.to(device)
+            vel_t = vel_t.to(device)
+            accel_t = accel_t.to(device)
+            trailer_t = trailer_t.to(device)
+            rev_t = rev_t.to(device)
 
-                with torch.no_grad():
-                    mean, logvar, _ = model(imgs, pos_rel, vel_t, accel_t, trailer_t, rev_t)
+            with torch.no_grad():
+                cont_logits, bern_logits, logvar, _ = model(pos_rel, vel_t, accel_t, trailer_t, rev_t, None)
 
-                mean = mean.squeeze(0).cpu().numpy()  # (5,)
+            cont_env = torch.tanh(cont_logits)
+            cont_env = cont_env.cpu().numpy().squeeze(0)  # (3,)
+            cont_env[1] *= 2
+            throttle = cont_env[0]
+            steer = cont_env[1]
+            # if (step < 100): throttle = 1
+            # else: throttle = float(np.clip(mean[0], 0.0, 1.0))
+            # brake = float(np.clip(mean[1], 0.0, 1.0))
+            # if (brake < 0.1): brake = 0.0
+            #print(mean[0], mean[1], mean[2])
+            # throttle = float(np.clip(mean[0], 0.0, 1.0))
+            # #print(throttle)
+            # brake = float(np.clip(mean[1], 0.0, 1.0))
+            #print(brake)
 
-                if (step < 100): throttle = 1
-                else: throttle = float(np.clip(mean[0], 0.0, 1.0))
-                brake = float(np.clip(mean[1], 0.0, 1.0))
-                if (brake < 0.1): brake = 0.0
-                steer = float(mean[2])
 
-                # rev_toggle = bool(mean[3] >= 0.5)
-                # handbrake = bool(mean[4] >= 0.5)
+            rev_toggle = bool(torch.sigmoid(bern_logits[0]).squeeze(0) >= 0.5)
+            # handbrake = bool(mean[4] >= 0.5)
+            # handbrake = False
 
-                # if (rev_toggle):
-                #     print("TOGGLED GEAR")
-                action = [throttle, brake, steer, mean[3], mean[4]]
+            # if (rev_toggle):
+            #     print("TOGGLED GEAR")
+            action = [throttle, steer, rev_toggle]
+            #print(action)
+            if vis is not None:
+                try:
+                    _update_visualizer_cv(vis, action)
+                except Exception as e:
+                    print(f"Visualizer error: {e}")
 
-                if vis is not None:
-                    try:
-                        _update_visualizer_cv(vis, action)
-                    except Exception as e:
-                        print(f"Visualizer error: {e}")
-
-                env.apply_control(action)
+            env.apply_control(action)
             
-            envs[0].world.tick()  # advance the shared world once per step
+            env.world.tick()  # advance the shared world once per step
+            #time.sleep(0.05)
+            # for i, env in enumerate(envs):
+            next_obs, reward, terminated, truncated = env.get_observation()
+            obs_env[0] = next_obs
 
-            for i, env in enumerate(envs):
-                next_obs, reward, terminated, truncated = env.get_observation()
-                obs_env[i] = next_obs
-
-                if terminated or truncated:
-                    print("Episode finished, resetting env")
-                    obs_env[i] = env.reset()
-
+            if terminated or truncated:
+                print("Episode finished, resetting env")
+                obs_env[0] = env.reset()
             step += 1
             #print(f"Step {step} completed")
             if args.max_steps is not None and step >= args.max_steps:

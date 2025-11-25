@@ -23,6 +23,8 @@ import numpy as np
 from PIL import Image
 import json
 import tempfile
+
+# from py import log
 from model import TruckNet
 import cv2 as cv
 
@@ -95,7 +97,6 @@ def _worker_init_fn(worker_id):
     random.seed(seed)
     np.random.seed(seed)
 
-
 class NpzFramesDataset(Dataset):
     """Dataset that indexes individual frames inside `.npz` chunk files saved by data_collection.py.
 
@@ -107,7 +108,7 @@ class NpzFramesDataset(Dataset):
             the dataset will detect its dimensionality and return it as a float32 tensor.
     """
 
-    def __init__(self, data_dir, transform=None, max_files=None):
+    def __init__(self, data_dir, transform=None, max_files=None, use_images=True):
         self.data_dir = Path(data_dir)
         files = sorted(self.data_dir.rglob('*.npz'))
         if max_files:
@@ -213,6 +214,7 @@ class NpzFramesDataset(Dataset):
         self.vel_indices = (0, 1)
         self.goal_indices = (0, 1, 4)
         self.accel_indices = (0, 1)
+        self.use_images = use_images
 
         # Try to load existing stats, otherwise compute them
         self.stats = None
@@ -342,24 +344,25 @@ class NpzFramesDataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to load frame idx {local_idx} from {fpath}: {e}")
 
-        if isinstance(frame, np.ndarray) and frame.dtype == object:
-            frame = frame.item()
+        if self.use_images:
+            if isinstance(frame, np.ndarray) and frame.dtype == object:
+                frame = frame.item()
 
-        images = frame.get('images')
+            images = frame.get('images')
+
+            imgs = []
+            for i in range(images.shape[0]):
+                im = Image.fromarray(images[i])
+
+                if self.transform:
+                    im = self.transform(im)
+                else:
+                    im = T.ToTensor()(im)
+                imgs.append(im)
+
+            # stack -> (4, 3, H, W)
+            imgs = torch.stack(imgs, dim=0)
         actions = frame.get('actions')
-
-        imgs = []
-        for i in range(images.shape[0]):
-            im = Image.fromarray(images[i])
-
-            if self.transform:
-                im = self.transform(im)
-            else:
-                im = T.ToTensor()(im)
-            imgs.append(im)
-
-        # stack -> (4, 3, H, W)
-        imgs = torch.stack(imgs, dim=0)
 
         a = np.array(actions, dtype=np.float32)
 
@@ -448,8 +451,209 @@ class NpzFramesDataset(Dataset):
             # ensure reverse flag is 1-D tensor (B,1) after stacking
             rev_t = torch.tensor([float(rev_raw)], dtype=torch.float32)
 
-            return imgs, actions, pos_t, vel_t, accel_t, trailer_angle_t, rev_t, goal_t
+            if self.use_images:
+                return imgs, actions, pos_t, vel_t, accel_t, trailer_angle_t, rev_t, goal_t
+            else:
+                return actions, pos_t, vel_t, accel_t, trailer_angle_t, rev_t, goal_t
 
+
+class NoImageDataset(Dataset):
+    def __init__(self, data_dir):
+        """
+        Args:
+            data_dir (str): Path to the directory containing the .npz files.
+        """
+        self.data_dir = Path(data_dir)
+        files = sorted(self.data_dir.rglob('*.npz'))
+        self.files = [str(f) for f in files]
+        
+        # Load the normalization stats file
+        self._stats_path = self.data_dir / '.norm_stats.json'
+        self.stats = None
+        if self._stats_path.exists():
+            try:
+                with open(self._stats_path, 'r') as fh:
+                    self.stats = json.load(fh)
+            except Exception as e:
+                print(f"Warning: Failed to load normalization stats: {e}")
+                self.stats = None
+
+
+        self.pos_indices = np.array([0, 1, 4])
+        self.vel_indices = np.array([0, 1])
+        self.goal_indices = np.array([0, 1, 4])
+        self.accel_indices = np.array([0, 1])
+
+        # If no stats found, compute them
+        if self.stats is None:
+            self.stats = self._compute_stats()
+
+    def _compute_stats(self):
+        # Streaming computation of mean and std for selected indices
+        pos_sum = np.zeros(len(self.pos_indices), dtype=np.float64)
+        pos_sumsq = np.zeros(len(self.pos_indices), dtype=np.float64)
+        vel_sum = np.zeros(len(self.vel_indices), dtype=np.float64)
+        vel_sumsq = np.zeros(len(self.vel_indices), dtype=np.float64)
+        accel_sum = np.zeros(len(self.accel_indices), dtype=np.float64)
+        accel_sumsq = np.zeros(len(self.accel_indices), dtype=np.float64)
+        goal_sum = np.zeros(len(self.goal_indices), dtype=np.float64)
+        goal_sumsq = np.zeros(len(self.goal_indices), dtype=np.float64)
+        count = 0
+
+        # Loop through files and calculate stats
+        for f in tqdm(self.files, desc='Computing normalization stats'):
+            try:
+                with np.load(f, allow_pickle=True) as d:
+                    frames = d['frames']
+                    for fr in frames:
+                        if isinstance(fr, np.ndarray) and fr.dtype == object:
+                            fr = fr.item()
+                        # Collecting the relevant fields
+                        pr_arr = np.array(fr.get('pos', [0, 0, 0, 0]), dtype=np.float32)
+                        vr_arr = np.array(fr.get('vel', [0, 0]), dtype=np.float32)
+                        ar_arr = np.array(fr.get('accel', [0, 0]), dtype=np.float32)
+                        gr_arr = np.array(fr.get('goal', [0, 0, 0]), dtype=np.float32)
+
+                        pos_sum += pr_arr
+                        pos_sumsq += pr_arr * pr_arr
+                        vel_sum += vr_arr
+                        vel_sumsq += vr_arr * vr_arr
+                        accel_sum += ar_arr
+                        accel_sumsq += ar_arr * ar_arr
+                        goal_sum += gr_arr
+                        goal_sumsq += gr_arr * gr_arr
+                        count += 1
+            except Exception:
+                continue
+
+        # Compute mean and std for each of the fields
+        def compute_mean_std(sum_arr, sumsq_arr):
+            mean = sum_arr / count
+            var = (sumsq_arr / count) - np.square(mean)
+            std = np.sqrt(np.maximum(var, 1e-6))
+            return mean.tolist(), std.tolist()
+
+        pos_mean, pos_std = compute_mean_std(pos_sum, pos_sumsq)
+        vel_mean, vel_std = compute_mean_std(vel_sum, vel_sumsq)
+        accel_mean, accel_std = compute_mean_std(accel_sum, accel_sumsq)
+        goal_mean, goal_std = compute_mean_std(goal_sum, goal_sumsq)
+
+        # Include ImageNet stats for RGB
+        rgb_mean = [0.485, 0.456, 0.406]
+        rgb_std = [0.229, 0.224, 0.225]
+
+        return {
+            'pos_mean': pos_mean,
+            'pos_std': pos_std,
+            'vel_mean': vel_mean,
+            'vel_std': vel_std,
+            'accel_mean': accel_mean,
+            'accel_std': accel_std,
+            'goal_mean': goal_mean,
+            'goal_std': goal_std,
+            'rgb_mean': rgb_mean,
+            'rgb_std': rgb_std,
+        }
+
+    def __len__(self):
+        """Returns the total number of frames in the dataset."""
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        """Returns the data (no images) for a single frame."""
+        file_path = self.files[idx]
+        try:
+            with np.load(file_path, allow_pickle=True) as d:
+                frames = d['frames']
+                frame = frames[0]  # Assuming we need the first frame in the chunk (modify this if needed)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load frame from {file_path}: {e}")
+
+        # Extract actions and positional data
+        actions = np.array(frame['actions'], dtype=np.float32)
+        actions_t = actions = torch.from_numpy(actions)
+        pos_raw = frame.get('pos', None)
+        vel_raw = frame.get('vel', None)
+        accel_raw = frame.get('accel', None)
+        goal_raw = frame.get('goal', None)
+
+
+
+        # Normalize position
+        pos_sel = []
+        for i in self.pos_indices:
+            pos_sel.append(float(pos_raw[i]))
+        pos_arr = np.array(pos_sel, dtype=np.float32)
+        pos_t = torch.tensor(pos_arr, dtype=torch.float32)
+        pos_t[:2] = 2 * (pos_t[:2] - WORKSPACE_BOUNDS[[0, 2]]) / (WORKSPACE_BOUNDS[[1, 3]] - WORKSPACE_BOUNDS[[0, 2]]) - 1
+        pos_t[2] = pos_t[2] / 180  # Normalize yaw
+
+        # Normalize velocity
+        vel_sel = []
+        for i in self.vel_indices:
+            vel_sel.append(float(vel_raw[i]))
+        vel_arr = np.array(vel_sel, dtype=np.float32)
+        vel_t = torch.tensor(vel_arr, dtype=torch.float32)
+        vel_t = (vel_t - torch.tensor(self.stats['vel_mean'][:2], dtype=torch.float32)) / torch.tensor(self.stats['vel_std'][:2], dtype=torch.float32)
+
+        # Normalize acceleration
+        accel_sel = []
+        for i in self.accel_indices:
+            accel_sel.append(float(accel_raw[i]))
+        accel_arr = np.array(accel_sel, dtype=np.float32)
+        accel_t = torch.tensor(accel_arr, dtype=torch.float32)
+        accel_t = (accel_t - torch.tensor(self.stats['accel_mean'][:2], dtype=torch.float32)) / torch.tensor(self.stats['accel_std'][:2], dtype=torch.float32)
+
+        # Normalize goal
+        goal_sel = []
+        for i in self.goal_indices:
+            goal_sel.append(float(goal_raw[i]))
+            
+        goal_arr = np.array(goal_sel, dtype=np.float32)
+        goal_t = torch.tensor(goal_arr, dtype=torch.float32)
+        goal_t[:2] = 2 * (goal_t[:2] - WORKSPACE_BOUNDS[[0, 2]]) / (WORKSPACE_BOUNDS[[1, 3]] - WORKSPACE_BOUNDS[[0, 2]]) - 1
+        goal_t[2] = goal_t[2] / 180  # Normalize yaw
+
+        # Trailer Angle
+        trailer_angle_raw = frame.get('trailer_angle', None)
+        if trailer_angle_raw is None:
+            raise Exception("trailer_angle data not found")
+        trailer_angle_arr = np.array(trailer_angle_raw, dtype=np.float32).ravel()
+        # ensure trailer angle is a 1-D tensor of length 1 so stacking yields (B,1)
+        ta_val = float(trailer_angle_arr[0]) if trailer_angle_arr.size > 0 else 0.0
+        trailer_angle_t = torch.tensor([ta_val], dtype=torch.float32)
+        trailer_angle_t /= 180.0  # scale to [-1, 1]
+
+        # Reverse
+        rev_raw = frame.get('reverse', None)
+        if rev_raw is None:
+            raise Exception("reverse data not found")
+        # ensure reverse flag is 1-D tensor (B,1) after stacking
+        rev_t = torch.tensor([float(rev_raw)], dtype=torch.float32)
+
+        return actions, pos_t, vel_t, accel_t, trailer_angle_t, rev_t, goal_t
+    
+def collate_fn_no_image(batch):
+    # Expect each element to be (imgs, actions, pos, vel, accel, trailer_angle, reverse, goal)
+    if len(batch[0]) != 7:
+        raise RuntimeError(f"Expected batch elements of length 7 (actions, pos, vel, accel, trailer_angle, reverse, goal), got {len(batch[0])}")
+
+    acts = [b[0] for b in batch]
+    poss = [b[1] for b in batch]
+    vels = [b[2] for b in batch]
+    accels = [b[3] for b in batch]
+    trailer_angles = [b[4] for b in batch]
+    revs = [b[5] for b in batch]
+    goals = [b[6] for b in batch]
+
+    acts = torch.stack(acts, dim=0)
+    poss = torch.stack(poss, dim=0)
+    vels = torch.stack(vels, dim=0)
+    accels = torch.stack(accels, dim=0)
+    trailer_angles = torch.stack(trailer_angles, dim=0)
+    revs = torch.stack(revs, dim=0)
+    goals = torch.stack(goals, dim=0)
+    return acts, poss, vels, accels, trailer_angles, revs, goals
 
 def collate_fn(batch):
     # Expect each element to be (imgs, actions, pos, vel, accel, trailer_angle, reverse, goal)
@@ -476,7 +680,7 @@ def collate_fn(batch):
     return imgs, acts, poss, vels, accels, trailer_angles, revs, goals
 
 
-def train_epoch(model, loader, optim, device, desc=None, writer=None, global_step_base=0):
+def train_epoch(model, loader, optim, device, desc=None, writer=None, global_step_base=0, use_images=False):
     """
     Train for one epoch using negative log-likelihood loss computed from the
     model's predicted (mean, var) outputs. The first 3 outputs are treated as
@@ -492,10 +696,16 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
         pbar = tqdm(total=len(loader), desc=desc, leave=False)
 
     for batch_idx, batch in enumerate(it):
-        imgs, actions, poss, vels, accels, trailer_angles, revs, goals = batch
+        if use_images:
+            imgs, actions, poss, vels, accels, trailer_angles, revs, goals = batch
+        else:
+            actions, poss, vels, accels, trailer_angles, revs, goals = batch
 
         # move to device; if pin_memory=True in DataLoader we can use non_blocking
-        imgs = imgs.to(device, non_blocking=True)
+        if use_images:
+            imgs = imgs.to(device, non_blocking=True)
+        else:
+            imgs = None
         actions = actions.to(device, non_blocking=True)
         poss = poss.to(device, non_blocking=True)
         vels = vels.to(device, non_blocking=True)
@@ -509,44 +719,36 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
         ctx = nullcontext()
 
         with ctx:
-            mean, var, _ = model(imgs, goals-poss, vels, accels, trailer_angles, revs)
+            cont_logits, bern_logits, log_std, value = model(goals-poss, vels, accels, trailer_angles, revs, imgs)
 
-        cont_mean = mean[:, :3]
-        cont_logvar = var[:, :3]
+        # print(f"cont_logits: {cont_logits.shape}, bern_logits: {bern_logits.shape}, log_std: {log_std.shape}")
 
-        cont_logvar = torch.clamp(cont_logvar, min=-10.0, max=2.0)
-        cont_std = torch.exp(0.5 * cont_logvar)
-
-        cont_std = torch.clamp(cont_std, min=1e-3)
-
-        bin_prob = mean[:, 3:] # last two actions are binary
-        bin_prob = torch.clamp(bin_prob, min=1e-6, max=1.0 - 1e-6)
-
-        cont_target = actions[:, :3]
-
-        bin_target = actions[:, 3:]
-        #print("revs shape:", revs.shape)
-        #print(bin_target[:, 0].shape)
-        bin_target[:, 0] = revs[:, 0] # set reverse action to be a 1 or a 0 based on the rev flag (no longer based on toggle)
-
-        normal = torch.distributions.Normal(cont_mean, cont_std)
-        logp_cont = normal.log_prob(cont_target)
+        cont_env = torch.tanh(cont_logits)
+        cont_env = cont_env * torch.tensor([1.0, 2.0], device=cont_env.device)  # broadcast-safe scaling
+        std = log_std.exp()
+        normal = torch.distributions.Normal(cont_env, std)
+        actions_env = torch.zeros((actions.shape[0], 2), device=device)
+        actions_env[:, 0] = actions[:, 0] - actions[:, 1] # throttle - brake
+        actions_env[:, 1] = actions[:, 2] # steering
+        # print(f"actions_env: {actions_env.shape}")
+        logp_cont = normal.log_prob(actions_env)
         logp_cont = logp_cont.sum(dim=1)
 
-        # compute log-prob for binary using Bernoulli
-        bern = torch.distributions.Bernoulli(probs=bin_prob)
-
-        logp_bin = bern.log_prob(bin_target)
+        bin_target = actions[:, 3:4]  # binary target for reverse
+        bin_prob = torch.sigmoid(bern_logits[:, 0])
+        logp_bin = torch.distributions.Bernoulli(probs=bin_prob).log_prob(bin_target)
         logp_bin = logp_bin.sum(dim=1)
 
         logp = logp_cont + logp_bin
         loss = -logp.mean()
-
+        # print(f"loss: {loss.item()}")
         optim.zero_grad()
         loss.backward()
         optim.step()
-
-        batch_size = imgs.shape[0]
+        batch_size = actions.shape[0]
+        with torch.no_grad():
+            model.log_std.clamp_(min=-5.0, max=0.5)
+        #batch_size = imgs.shape[0]
         total_loss += loss.item() * batch_size
         total_samples += batch_size
         # per-batch tensorboard logging (if writer provided)
@@ -555,9 +757,9 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
             try:
                 writer.add_scalar('loss/train_batch', float(loss.item()), step)
                 # log continuous std stats (first three dims)
-                writer.add_scalar('cont_std/min', float(cont_std[:, :3].min().item()), step)
-                writer.add_scalar('cont_std/mean', float(cont_std[:, :3].mean().item()), step)
-                writer.add_scalar('cont_std/max', float(cont_std[:, :3].max().item()), step)
+                writer.add_scalar('cont_std/min', float((torch.exp(log_std)[:, :2]).min().item()), step)
+                writer.add_scalar('cont_std/mean', float((torch.exp(log_std)[:, :2]).mean().item()), step)
+                writer.add_scalar('cont_std/max', float((torch.exp(log_std)[:, :2]).max().item()), step)
             except Exception:
                 pass
         if pbar is not None:
@@ -568,7 +770,7 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
     return total_loss / max(1, total_samples)
 
 
-def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0):
+def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0, use_images=False):
     """
     Evaluate one epoch using negative log-likelihood from the model's
     (mean, var) outputs. Mirrors train_epoch behavior but without gradient steps.
@@ -581,9 +783,15 @@ def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0
         pbar = tqdm(total=len(loader), desc=desc, leave=False)
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
-            imgs, actions, poss, vels, accels, trailer_angles, revs, goals = batch
+            if use_images:
+                imgs, actions, poss, vels, accels, trailer_angles, revs, goals = batch
+            else:
+                actions, poss, vels, accels, trailer_angles, revs, goals = batch
 
-            imgs = imgs.to(device, non_blocking=True)
+            if use_images:
+                imgs = imgs.to(device, non_blocking=True)
+            else:
+                imgs = None
             actions = actions.to(device, non_blocking=True)
             poss = poss.to(device, non_blocking=True)
             vels = vels.to(device, non_blocking=True)
@@ -596,29 +804,28 @@ def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0
             ctx = nullcontext()
 
             with ctx:
-                mean, var, _ = model(imgs, goals-poss, vels, accels, trailer_angles, revs)
+                cont_logits, bern_logits, log_std, value = model(goals-poss, vels, accels, trailer_angles, revs, imgs)
 
-            cont_mean = mean[:, :3]
-            cont_logvar = var[:, :3]
-            cont_logvar = torch.clamp(cont_logvar, min=-20.0, max=2.0)
-            cont_std = torch.exp(0.5 * cont_logvar)
+            cont_env = torch.tanh(cont_logits)
+            cont_env = cont_env * torch.tensor([1.0, 2.0], device=cont_env.device)  # broadcast-safe scaling
+            normal = torch.distributions.Normal(cont_env, torch.exp(log_std))
+            
+            actions_env = torch.zeros((actions.shape[0], 2), device=device)
+            actions_env[:, 0] = actions[:, 0] - actions[:, 1] # throttle - brake
+            actions_env[:, 1] = actions[:, 2] # steering
+            logp_cont = normal.log_prob(actions_env)
+            logp_cont = logp_cont.sum(dim=1)
 
-            bin_prob = mean[:, 3:]
-
-            cont_target = actions[:, :3]
-            bin_target = actions[:, 3:]
-            bin_target[:, 0] = revs[:, 0]
-
-            normal = torch.distributions.Normal(cont_mean, cont_std)
-            logp_cont = normal.log_prob(cont_target).sum(dim=1)
-
-            bern = torch.distributions.Bernoulli(probs=bin_prob)
-            logp_bin = bern.log_prob(bin_target).sum(dim=1)
+            bin_target = actions[:, 3:4]  # binary target for reverse
+            bin_prob = torch.sigmoid(bern_logits[:, 0])
+            logp_bin = torch.distributions.Bernoulli(probs=bin_prob).log_prob(bin_target)
+            logp_bin = logp_bin.sum(dim=1)
 
             logp = logp_cont + logp_bin
             loss = -logp.mean()
 
-            batch_size = imgs.shape[0]
+            batch_size = actions.shape[0]
+            #batch_size = imgs.shape[0]
             total_loss += loss.item() * batch_size
             total_samples += batch_size
             # per-batch tensorboard logging (if writer provided)
@@ -626,9 +833,9 @@ def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0
                 step = global_step_base + batch_idx
                 try:
                     writer.add_scalar('loss/val_batch', float(loss.item()), step)
-                    writer.add_scalar('cont_std_val/min', float((torch.exp(0.5*cont_logvar)[:, :3]).min().item()), step)
-                    writer.add_scalar('cont_std_val/mean', float((torch.exp(0.5*cont_logvar)[:, :3]).mean().item()), step)
-                    writer.add_scalar('cont_std_val/max', float((torch.exp(0.5*cont_logvar)[:, :3]).max().item()), step)
+                    writer.add_scalar('cont_std_val/min', float((torch.exp(0.5*log_std)[:, :2]).min().item()), step)
+                    writer.add_scalar('cont_std_val/mean', float((torch.exp(0.5*log_std)[:, :2]).mean().item()), step)
+                    writer.add_scalar('cont_std_val/max', float((torch.exp(0.5*log_std)[:, :2]).max().item()), step)
                 except Exception:
                     pass
             if pbar is not None:
@@ -662,8 +869,12 @@ def main():
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
+    use_images = False
 
-    dataset = NpzFramesDataset(args.data_dir, transform=transform)
+    if use_images:
+        dataset = NpzFramesDataset(args.data_dir, transform=transform, use_images=use_images)
+    else:
+        dataset = NoImageDataset(args.data_dir)
     if len(dataset) == 0:
         raise RuntimeError(f"No frames found in {args.data_dir}. Check that .npz files exist and contain 'frames'.")
 
@@ -682,7 +893,12 @@ def main():
     if args.workers > cpu_count - 1:
         print(f"Warning: requested --workers={args.workers} but only {cpu_count} CPUs detected; using {max_workers} workers")
 
-    dl_kwargs = dict(collate_fn=collate_fn, worker_init_fn=_worker_init_fn)
+    if use_images:
+        dl_collate_fn = collate_fn
+    else:
+        dl_collate_fn = collate_fn_no_image
+
+    dl_kwargs = dict(collate_fn=dl_collate_fn, worker_init_fn=_worker_init_fn)
     if max_workers > 0:
         dl_kwargs.update(dict(num_workers=max_workers, pin_memory=args.pin_memory))
         # only set prefetch_factor / persistent_workers when workers > 0 and arg provided
@@ -691,7 +907,7 @@ def main():
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **dl_kwargs)
 
-    val_dl_kwargs = dict(collate_fn=collate_fn, worker_init_fn=_worker_init_fn)
+    val_dl_kwargs = dict(collate_fn=dl_collate_fn, worker_init_fn=_worker_init_fn)
     if val_workers > 0:
         val_dl_kwargs.update(dict(num_workers=val_workers, pin_memory=args.pin_memory))
         val_dl_kwargs['prefetch_factor'] = max(1, args.prefetch_factor // 2)
@@ -701,7 +917,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = TruckNet(pretrained=args.pretrained).to(device)
+    model = TruckNet(pretrained=args.pretrained, use_images=use_images).to(device)
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint, map_location=device)
         state = ckpt.get('model_state', ckpt)
@@ -718,8 +934,8 @@ def main():
     try:
         for epoch in range(1, args.epochs + 1):
             t0 = time.time()
-            train_loss = train_epoch(model, train_loader, optimizer, device, desc=f"Train E{epoch}", writer=writer, global_step_base=(epoch-1)*len(train_loader) if writer is not None else 0)
-            val_loss = eval_epoch(model, val_loader, device, desc=f"Val E{epoch}", writer=writer, global_step_base=(epoch-1)*len(val_loader) if writer is not None else 0)
+            train_loss = train_epoch(model, train_loader, optimizer, device, desc=f"Train E{epoch}", writer=writer, global_step_base=(epoch-1)*len(train_loader) if writer is not None else 0, use_images=use_images)
+            val_loss = eval_epoch(model, val_loader, device, desc=f"Val E{epoch}", writer=writer, global_step_base=(epoch-1)*len(val_loader) if writer is not None else 0, use_images=use_images)
             dt = time.time() - t0
 
             print(f"Epoch {epoch}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  time={dt:.1f}s")
@@ -745,12 +961,12 @@ def main():
                 'optim_state': optimizer.state_dict(),
                 'args': vars(args),
             }
-            ckpt_path = os.path.join(args.save_dir, f"bc_epoch_{epoch:03d}.pt")
+            ckpt_path = os.path.join(args.save_dir, f"bc_epoch_{epoch:03d}_no_image.pt")
             torch.save(ckpt, ckpt_path)
 
             if val_loss < best_val:
                 best_val = val_loss
-                best_path = os.path.join(args.save_dir, 'best.pt')
+                best_path = os.path.join(args.save_dir, 'best_no_image.pt')
                 torch.save(ckpt, best_path)
     except Exception as e:
         print(f"Error: {str(e)}")
