@@ -22,13 +22,11 @@ import cv2
 import numpy as np
 import time
 import math
-from reward_visualizer import RewardVisualizer, EpisodeRewardTracker
 
 SHOW_PREVIEW = False
 IM_WIDTH = 640
 IM_HEIGHT = 480
 RENDER_CARLA = True # SET TO FALSE FOR TRAINING
-SHOW_REWARD_VISUALIZATION = True  # Set to True to display reward visualization window
 
 class TruckEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -48,8 +46,8 @@ class TruckEnv:
             self.world = world
 
         # Taken from example file
-        self.player_max_speed = 1.589
-        self.player_max_speed_fast = 3.713
+        self.player_max_speed = 1.589 / 2
+        self.player_max_speed_fast = 3.713 / 2
 
         self._actor_generation = "2"
         # Get a random blueprint.
@@ -88,13 +86,16 @@ class TruckEnv:
         self.world.apply_settings(settings)
 
         self.goal_pos = None
+        self.difficulty = 0.0 # 0 is easiest, 1 is hardest
+        self.min_difficulty = 1.0
+        self.max_difficulty = 8.0
 
         self.goal_points = [
-            (carla.Transform(carla.Location(-43.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Right"),
+            # (carla.Transform(carla.Location(-43.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Right"),
             (carla.Transform(carla.Location(-54, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Center"),
-            (carla.Transform(carla.Location(-63.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Left"),
-            (carla.Transform(carla.Location(-43.5, 182.5, 1), carla.Rotation(0, -180, 0)), "Right Top"),
-            (carla.Transform(carla.Location(-43.5, 192.5, 1), carla.Rotation(0, -180, 0)), "Right Bottom")
+            # (carla.Transform(carla.Location(-63.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Left"),
+            # (carla.Transform(carla.Location(-43.5, 182.5, 1), carla.Rotation(0, -180, 0)), "Right Top"),
+            # (carla.Transform(carla.Location(-43.5, 192.5, 1), carla.Rotation(0, -180, 0)), "Right Bottom")
         ]
 
         self.goal_idx = goal_idx
@@ -107,14 +108,6 @@ class TruckEnv:
         self.last_dist_to_goal = None
         self.last_yaw_diff = None
         self.last_trailer_angle = None
-        
-        # Initialize reward visualization
-        if SHOW_REWARD_VISUALIZATION:
-            self.reward_visualizer = RewardVisualizer(window_name=f"TruckEnv Rewards (Goal {goal_idx})")
-            self.episode_reward_tracker = EpisodeRewardTracker()
-        else:
-            self.reward_visualizer = None
-            self.episode_reward_tracker = None
 
 
     def reset(self):
@@ -125,10 +118,6 @@ class TruckEnv:
         self.last_dist_to_goal = None
         self.last_yaw_diff = None
         self.last_trailer_angle = None
-        
-        # Reset episode reward tracker
-        if self.episode_reward_tracker is not None:
-            self.episode_reward_tracker.reset()
         
         self.destroy()
 
@@ -169,13 +158,21 @@ class TruckEnv:
             )
             #print(f"Spawn point: ({spawn_point.location.x}, {spawn_point.location.y}, {spawn_point.location.z})")
             # --------------------------------------------------------------
-
+            # Adjust spawn rotation based on difficulty
+            spawn_point.rotation.yaw += self.difficulty * 20.0  # Scale yaw rotation with difficulty (0-45 degrees)
             # Training regimen: start near the goal
             if rand_goal_name in ["Bottom Right", "Bottom Center", "Bottom Left"]:
-                spawn_point.location.y -= 12
+                spawn_point.location.y -= 15 #+ np.random.uniform(-3, 3)
+                width = self.difficulty * (self.max_difficulty - self.min_difficulty) + self.min_difficulty
+                spawn_point.location.x += np.random.uniform(-width, width) # scale this up later
             else:
-                spawn_point.location.x -= 12
+                spawn_point.location.x -= 12 #+ np.random.uniform(-3, 3)
+                spawn_point.location.y += np.random.uniform(-7, 7)
 
+        
+
+            # spawn_point.location.x += np.random.uniform(-10, 10)
+            # spawn_point.location.y += np.random.uniform(-10, 10)
             spawn_point.location.x += 11000 * self.map_location / 100
 
             # Try to spawn the trailer
@@ -209,7 +206,6 @@ class TruckEnv:
 
         collision_blueprint = self.world.get_blueprint_library().find('sensor.other.collision')
         self.player_collision_sensor = self.world.spawn_actor(collision_blueprint, carla.Transform(), attach_to=self.player)
-
 
         self.player_collision_sensor.listen(lambda event: self._on_collision(event))
         self.actor_list.append(self.player_collision_sensor)
@@ -246,7 +242,10 @@ class TruckEnv:
         self.control.steer = float(action[1])
 
         if (float(action[0]) < 0):
-            self.control.brake = -float(action[0])
+            if (float(action[0]) > -0.02): # deadzone for brake
+                self.control.brake = 0.0
+            else:
+                self.control.brake = -float(action[0])
             self.control.throttle = 0.0
         else:
             self.control.throttle = float(action[0])
@@ -277,16 +276,16 @@ class TruckEnv:
         # else:
         #     vel_thresh = 0.01
 
-        if self.phase != 2:
-            vel_thresh = 0.05
-            pos_thresh = 3
-            trailer_angle_thresh = 15
-            yaw_thresh = 8
-        else:
-            vel_thresh = 0.01
-            pos_thresh = 1.5
-            trailer_angle_thresh = 8
-            yaw_thresh = 5
+        # if self.phase != 2:
+        vel_thresh = 0.1
+        pos_thresh = 3.5
+        trailer_angle_thresh = 15
+        yaw_thresh = 15
+        # else:
+        #     vel_thresh = 0.01
+        #     pos_thresh = 1.5
+        #     trailer_angle_thresh = 8
+        #     yaw_thresh = 5
         
         player_pos = self.player.get_transform()
         x_dist = self.goal_pos.location.x + 11000 * self.map_location / 100 - player_pos.location.x
@@ -305,6 +304,7 @@ class TruckEnv:
         elif yaw_diff < -180: yaw_diff += 360
         yaw_diff = min(abs(yaw_diff), 360 - abs(yaw_diff))  # account for wrap-around
         yaw_diff = abs(yaw_diff)
+        
         trailer_pos = self.playerTrailer.get_transform()
         trailer_angle_error = np.abs(player_pos.rotation.yaw % 360 - trailer_pos.rotation.yaw % 360) # this error should be between 0 and 90
         trailer_angle_error = min(trailer_angle_error, 360 - trailer_angle_error)  # account for wrap-around
@@ -334,31 +334,20 @@ class TruckEnv:
         if trailer_angle > 180: trailer_angle -= 360
         elif trailer_angle < -180: trailer_angle += 360
 
-        # Initialize reward components tracking
-        reward_components = {
-            'Goal Bonus': 0.0,
-            'Collision': 0.0,
-            'Distance': 0.0,
-            'Yaw': 0.0,
-            'Trailer Angle': 0.0
-        }
-        
         reward = 0
         collision = self.collision
         if self._at_goal(pos_tol=pos_thresh, angle_tol=yaw_thresh, trailer_tol=trailer_angle_thresh, vel_tol=vel_thresh):
             terminated = True
             if RENDER_CARLA:
                 print("At Goal!")
-            reward_components['Goal Bonus'] = 500.0
-            reward += 500.0
+            reward += 350.0
         
         if self.collision:
-            if self.phase == 2:
-                reward_components['Collision'] = -10.0
-                reward += -10.0
-            else:
-                reward_components['Collision'] = -2.0  # very small penalty collision
-                reward += -2.0
+            # if self.phase == 2:
+            #     reward += -10.0
+            #     truncated = True
+            # else:
+            #     reward += -0.5 # very small penalty collision
             self.collision = False
 
         # if trailer_angle_error > 60:
@@ -370,37 +359,38 @@ class TruckEnv:
             self.last_trailer_angle = trailer_angle_error
         
         delta_dist = self.last_dist_to_goal - dist_to_goal
-        dist_reward = 5 * delta_dist if delta_dist > 0 else 3 * delta_dist
-        reward_components['Distance'] = dist_reward
-        reward += dist_reward
+        reward += 2.0 * delta_dist  # scaled down from 10.0 to avoid huge spikes
         self.last_dist_to_goal = dist_to_goal
 
         delta_yaw = self.last_yaw_diff - yaw_diff
-        yaw_reward = 3 * delta_yaw if delta_yaw > 0 else 1 * delta_yaw
-        reward_components['Yaw'] = yaw_reward
-        reward += yaw_reward
+        reward += 0.5 * delta_yaw  # symmetric: reward improvement AND penalize regression
         self.last_yaw_diff = yaw_diff
 
         delta_trailer_angle = self.last_trailer_angle - trailer_angle_error
-        trailer_reward = 3 * delta_trailer_angle if delta_trailer_angle > 0 else 1 * delta_trailer_angle
-        reward_components['Trailer Angle'] = trailer_reward
-        reward += trailer_reward
+        reward += 1.0 * delta_trailer_angle  # scaled down from 4.0
         self.last_trailer_angle = trailer_angle_error
+
+        if trailer_angle_error > 60:
+            reward += -1.0  # stronger jackknife penalty
+        
+        reward -= 0.01  # step cost to encourage faster solutions
+        reward *= 0.1  # scale down overall reward to keep it smaller
+        # reward -= (dist_to_goal + yaw_diff + trailer_angle_error) * 1e-3
+
+        # if trailer_angle_error > 60:
+        #     reward -= 0.2
+        # if trailer_angle_error > 90:
+        #     reward -= 1.0 
 
         #print(f"Delta Dist Reward: {delta_dist *6:.3f}, Delta Yaw Reward: {delta_yaw *2:.3f}, Delta Trailer Angle Reward: {delta_trailer_angle *1:.3f}")
         #print(delta_trailer_angle *0.1 + delta_yaw *0.2 + delta_dist *0.6)
         # if (self.curr_steps % 1000) == 0:
         #     print(delta_dist *60 + delta_yaw *20 + delta_trailer_angle *10)
-        reward -= 0.01 # step penalty to encourage faster solutions
+        #reward -= 0.005 # step penalty to encourage faster solutions
 
         # if (self.curr_steps % 1000) == 0:
         #     print(f"reward: {reward}")
         #reward = float(max(-10.0, min(30.0, reward)))
-
-        # Update visualizations
-        if self.reward_visualizer is not None:
-            self.reward_visualizer.update(reward_components, reward)
-            self.episode_reward_tracker.add_step(reward_components)
 
         vel = self.player.get_velocity()
         accel = self.player.get_acceleration()
@@ -419,6 +409,9 @@ class TruckEnv:
 
         if RENDER_CARLA and self.curr_steps % 100 == 0:
             print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw: {pos.rotation.yaw:.2f}, Yaw Diff: {yaw_diff:.2f}, Trailer Angle: {trailer_angle:.2f}, Collision: {collision}")
+
+        if not terminated and not truncated:
+            reward = np.clip(reward, -2.0, 5.0)  # bounded rewards for stable training
 
         return obs, reward, terminated, truncated
 
@@ -562,14 +555,10 @@ class TruckEnv:
                 print(f"Error destroying actor: {e}")
         self.actor_list = []
 
-        # Close reward visualizer if it exists
-        if self.reward_visualizer is not None:
-            self.reward_visualizer.close()
-
         # Tick the world a few times to make sure actors are removed
-        for _ in range(5):
-            self.world.tick()
-            time.sleep(0.05)
+        #for _ in range(5):
+        self.world.tick()
+        time.sleep(0.05)
 
 if __name__ == "__main__":
     env = TruckEnv()

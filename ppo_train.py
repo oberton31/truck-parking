@@ -15,7 +15,7 @@ except IndexError:
 
 import carla
 import torch
-from model import TruckNet
+from modelv2 import TruckNet
 from torchrl.data import ReplayBuffer, LazyTensorStorage, SamplerWithoutReplacement
 from torch.utils.data import BatchSampler, RandomSampler
 
@@ -47,9 +47,9 @@ def log_to_file(msg):
         f.write(msg + "\n")
 
 class PPOMultiAgent:
-    def __init__(self, lr=5e-4, gamma=0.99, gae_lambda=0.95,
-                 clip_coef=0.2, vf_coef=0.5, ent_coef=0.02, max_grad_norm=0.7,
-                 update_epochs=10, minibatch_size=16, rollout_steps=500, 
+    def __init__(self, lr=3e-5, gamma=0.99, gae_lambda=0.95,
+                 clip_coef=0.1, vf_coef=0.5, ent_coef=0.001, max_grad_norm=0.5,
+                 update_epochs=8, minibatch_size=128, rollout_steps=2048, 
                  policy=None, device="cuda", checkpoint_filepath=None, num_agents=1, use_images=True):
         
         self.device = torch.device(device)
@@ -57,7 +57,7 @@ class PPOMultiAgent:
         # instantiate model and move to device
         self.use_images = use_images
         if policy is None:
-            self.policy = TruckNet(pretrained=False, use_images=use_images).to(self.device)
+            self.policy = TruckNet().to(self.device)
             if checkpoint_filepath is not None:
                 ckpt = torch.load(checkpoint_filepath, map_location=self.device)
                 state = ckpt.get('model_state', ckpt)
@@ -68,6 +68,7 @@ class PPOMultiAgent:
 
         self.num_agents = num_agents
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        self.base_lr = lr
 
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -81,6 +82,12 @@ class PPOMultiAgent:
 
         self.rollout = None
         self.ptr = 0
+        self.update_step = 0
+    
+    def set_learning_rate(self, lr):
+        """Update learning rate for optimizer."""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
 
     def init_multiagent_rollout(self, obs_sample: TensorDict, num_agents: int):
         """Initialize multi-agent rollout buffer."""
@@ -118,6 +125,7 @@ class PPOMultiAgent:
         """
         if self.rollout is None:
             self.init_multiagent_rollout(obs_list[0], num_agents=len(obs_list))
+        any_done = dones.float().max()  # 1.0 if any agent is done
 
         for agent_id, obs in enumerate(obs_list):
             self.rollout["obs"][self.ptr, agent_id] = TensorDict(
@@ -153,7 +161,7 @@ class PPOMultiAgent:
                 batch_obs["accel"],
                 batch_obs["trailer_angle"],
                 batch_obs["reverse"],
-                batch_obs["images"] if self.use_images else None
+                #batch_obs["images"] if self.use_images else None
             )
 
             std = log_std.exp()  # [1,3]
@@ -174,17 +182,17 @@ class PPOMultiAgent:
             cont_action_env = torch.cat([a0, a1], dim=1)
 
             # Bernoulli actions
-            bern_dist = Bernoulli(logits=bern_logits)
-            bern_action = bern_dist.sample()
-            bern_logp = bern_dist.log_prob(bern_action).sum(-1)
-
+            # bern_dist = Bernoulli(logits=bern_logits)
+            # bern_action = bern_dist.sample()
+            # bern_logp = bern_dist.log_prob(bern_action).sum(-1)
+            bern_action = torch.ones(bern_logits.shape, device=self.device) # make always reverse
             action_env = torch.cat([cont_action_env, bern_action], dim=1)
-            log_prob = cont_logp + bern_logp
+            log_prob = cont_logp #+ bern_logp
 
-            writer.add_scalar("Action/cont_log_std_0", log_std[0], global_step=self.ptr)
-            writer.add_scalar("Action/cont_log_std_1", log_std[1], global_step=self.ptr)
-            writer.add_scalar("Log_prob/cont_log_prob", cont_logp, global_step=self.ptr)
-            writer.add_scalar("Log_prob/bern_log_prob", bern_logp, global_step=self.ptr)
+            writer.add_scalar("Action/cont_log_std_0", log_std[0], global_step=self.update_step)
+            writer.add_scalar("Action/cont_log_std_1", log_std[1], global_step=self.update_step)
+            writer.add_scalar("Log_prob/cont_log_prob", cont_logp, global_step=self.update_step)
+            # writer.add_scalar("Log_prob/bern_log_prob", bern_logp, global_step=self.update_step)
         return action_env.squeeze(0), log_prob.squeeze(0), value.squeeze(0), raw_cont_action.squeeze(0)
     
     def compute_gae_multiagent(self, last_values=None):
@@ -211,8 +219,13 @@ class PPOMultiAgent:
             advantages[t] = delta + self.gamma * self.gae_lambda * masks[t] * last_adv
             last_adv = advantages[t]
 
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = advantages.clamp(-3.0, 3.0)
+        #returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        # Optional: clip to prevent extreme values
+        returns = returns.clamp(-30.0, 30.0)
+        #returns = returns.clamp(-10.0, 10.0)
         self.rollout["advantage"] = advantages
         self.rollout["return"] = returns
 
@@ -226,6 +239,10 @@ class PPOMultiAgent:
             drop_last=False
         )
 
+        kl_div = []
+        value_losses = []
+        policy_losses = []
+        entropy_losses = []
         for _ in range(self.update_epochs):
             for batch_indices in sampler:
                 batch = flat_rollout[batch_indices]
@@ -243,7 +260,7 @@ class PPOMultiAgent:
                     batch_obs["accel"],
                     batch_obs["trailer_angle"],
                     batch_obs["reverse"],
-                    batch_obs["images"] if self.use_images else None
+                    #batch_obs["images"] if self.use_images else None
                 )
 
                 std = log_std.exp()
@@ -252,29 +269,55 @@ class PPOMultiAgent:
 
 
                 # Bernoulli log-prob
-                bern_dist = Bernoulli(logits=bern_logits)
-                bern_logp = bern_dist.log_prob(batch_actions[:, 2:3]).sum(-1)
+                # bern_dist = Bernoulli(logits=bern_logits)
+                # bern_logp = bern_dist.log_prob(batch_actions[:, 2:3]).sum(-1)
 
-                log_probs = cont_logp + bern_logp
+                log_probs = cont_logp #+ bern_logp
 
                 # PPO loss
                 ratio = (log_probs - batch_log_probs).exp()
-                writer.add_scalar("PPO/ratio_mean", ratio.mean(), global_step=self.ptr)
+                kl_div.append(ratio.mean().item())
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = ((values.squeeze(-1) - batch_returns)**2).mean()
-                entropy_loss = cont_dist.entropy().mean() + bern_dist.entropy().mean()
+
+                # Values predicted at rollout time (detach to prevent gradients)
+                values_old = batch["value"]                     # shape: [batch]
+                # Current predicted values from critic                         # shape: [batch]
+
+                # Value clipping (SB3 style)
+                # V_clip = V_old + clip(V - V_old, -clip_range, +clip_range)
+                value_clipped = values_old + (values - values_old).clamp(-self.clip_coef, self.clip_coef)
+
+                # Two value losses
+                value_loss_unclipped = (values - batch_returns).pow(2)
+                value_loss_clipped   = (value_clipped - batch_returns).pow(2)
+
+                # Final value loss = max of the two (prevents large value updates)
+                value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
+
+                entropy_loss = cont_dist.entropy().mean()# + bern_dist.entropy().mean()
 
                 loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy_loss
+
+                policy_losses.append(policy_loss.item())
+                value_losses.append(self.vf_coef * value_loss.item())
+                entropy_losses.append(self.ent_coef * entropy_loss.item())
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
-                with torch.no_grad():
-                    self.policy.log_std.clamp_(min=-5.0, max=0.5)
+        writer.add_scalar("PPO/ratio_mean", sum(kl_div) / len(kl_div) if kl_div else 0, global_step=self.update_step)
+        writer.add_scalar("PPO/policy_loss", sum(policy_losses) / len(policy_losses) if policy_losses else 0, global_step=self.update_step)
+        writer.add_scalar("PPO/value_loss", sum(value_losses) / len(value_losses) if value_losses else 0, global_step=self.update_step)
+        writer.add_scalar("PPO/entropy_loss", sum(entropy_losses) / len(entropy_losses) if entropy_losses else 0, global_step=self.update_step)
+        writer.add_scalar("PPO/ratio_min", ratio.min().item(), self.update_step)
+        writer.add_scalar("PPO/ratio_max", ratio.max().item(), self.update_step)
+        self.update_step += 1
+        with torch.no_grad():
+            self.policy.log_std.clamp_(min=-5.0, max=0.5)
 
     def evaluate(self, evaluate_steps, vel_mean, vel_std, accel_mean, accel_std, env, map_location=0):
         obs = env.reset()
@@ -286,8 +329,10 @@ class PPOMultiAgent:
         for step in range(evaluate_steps):
             with torch.no_grad():
                 action, _, _, _ = self.act(obs_td)
-
-            next_obs, reward, terminated, truncated = env.step(action.cpu().numpy())
+            env.apply_control(action.cpu().numpy())
+            for _ in range(2):
+                env.world.tick()
+            next_obs, reward, terminated, truncated = env.get_observation()
             total_reward += reward
 
             if terminated or truncated:
@@ -387,7 +432,103 @@ def frame_to_tensordict(obs, img_size, device='cpu', map_location=0, vel_mean=0,
     return obs
 
 
-def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, accel_mean=0, accel_std=1, max_training_steps=7_000_000, use_images=True):
+def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, accel_mean=0, accel_std=1, max_training_steps=10_000_000, use_images=True, warmup=True):
+
+    obs_list = [None] * num_agents
+
+    if warmup:
+        # Warm up value head with a few rollouts to stabilize advantages
+        print("Warming up value head...")
+
+        for i in range(num_agents):
+            obs = envs[i].reset()
+            obs_list[i] = frame_to_tensordict(obs, img_size, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, use_images=use_images)
+
+        warmup_steps = ppo.rollout_steps * 30
+        ppo.rollout = None
+        ppo.ptr = 0
+
+        for _ in range(warmup_steps):
+            actions = []
+            raw_cont_actions = []
+            values_this_step = []
+            log_probs_this_step = []
+
+            for obs in obs_list:
+                action, log_prob, value, raw_cont_action = ppo.act(obs, deterministic=True)
+                actions.append(action)
+                raw_cont_actions.append(raw_cont_action)
+                log_probs_this_step.append(log_prob)
+                values_this_step.append(value.item())
+
+            next_obs = []
+            next_rewards = []
+            next_terminated = []
+            next_truncated = []
+
+            for i in range(len(obs_list)):
+                envs[i].apply_control(actions[i].cpu().numpy())
+
+            for _ in range(2):
+                envs[0].world.tick()
+
+            for i in range(len(obs_list)):
+                o, r, term, trunc = envs[i].get_observation()
+                next_obs.append(frame_to_tensordict(o, 224, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std,
+                                                    accel_mean=accel_mean, accel_std=accel_std, use_images=ppo.use_images))
+                next_rewards.append(r)
+                next_terminated.append(term)
+                next_truncated.append(trunc)
+
+            rewards = torch.tensor(next_rewards, device=ppo.device, dtype=torch.float32)
+            dones = torch.tensor(next_terminated, device=ppo.device, dtype=torch.bool) | torch.tensor(next_truncated, device=ppo.device, dtype=torch.bool)
+
+            ppo.store_multiagent_transition(obs_list, torch.stack(actions), raw_cont_actions, rewards, dones, log_probs_this_step, values_this_step)
+
+            if any(dones):
+                for i in range(num_agents):
+                    if dones[i]:
+                        o = envs[i].reset()
+                        next_obs[i] = frame_to_tensordict(o, img_size, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, use_images=use_images)
+                    
+            obs_list = next_obs
+
+            if ppo.ptr >= ppo.rollout_steps:
+                ppo.compute_gae_multiagent(last_values=torch.tensor(values_this_step).to(ppo.device))
+
+                # Value-only update: no policy or entropy loss, only value loss
+                flat_rollout = ppo.rollout[:ppo.ptr].reshape(ppo.ptr * ppo.num_agents)
+                sampler = BatchSampler(
+                    RandomSampler(range(ppo.ptr * ppo.num_agents), replacement=False),
+                    batch_size=ppo.minibatch_size,
+                    drop_last=False
+                )
+
+                for _ in range(ppo.update_epochs):
+                    for batch_indices in sampler:
+                        batch = flat_rollout[batch_indices]
+                        batch_obs = {k: v.to(ppo.device) for k, v in batch["obs"].items()}
+                        batch_returns = batch["return"].to(ppo.device)
+
+                        _, _, _, values = ppo.policy(
+                            batch_obs["pos"],
+                            batch_obs["vel"],
+                            batch_obs["accel"],
+                            batch_obs["trailer_angle"],
+                            batch_obs["reverse"],
+                            #batch_obs["images"] if ppo.use_images else None
+                        )
+                        value_loss = ((values.squeeze(-1) - batch_returns)**2).mean()
+
+                        ppo.optimizer.zero_grad()
+                        value_loss.backward()
+                        nn.utils.clip_grad_norm_(ppo.policy.parameters(), ppo.max_grad_norm)
+                        ppo.optimizer.step()
+
+                ppo.rollout = None
+                ppo.ptr = 0
+
+        print("Value head warm-up complete.")
 
     obs_list = [None] * num_agents
     for i in range(num_agents):
@@ -398,7 +539,7 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
     episode = 0
     best_success_rate = -float('inf')
     evaluate = True
-    
+
     pbar = tqdm.tqdm(range(max_training_steps), dynamic_ncols=True)
 
     running_rewards = []
@@ -408,6 +549,8 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
     running_steer_values = []
     running_reverse_values = []
     running_success_rates = []
+    running_returns = []
+    current_returns = [0.0] * num_agents
 
     for step in pbar:        
         actions = []
@@ -436,21 +579,34 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
 
         for i in range(num_agents):
             envs[i].apply_control(actions[i].cpu().numpy())
-        envs[0].world.tick()
-        
+
+        for _ in range(2): # tick env 4 timesteps (decision period of 4 Hz)
+            envs[0].world.tick()
+        # TODO: if continues to not work, try making stepping the world a few times per step
+
         for i in range(num_agents):
             o, r, term, trunc = envs[i].get_observation()
             next_obs.append(frame_to_tensordict(o, img_size, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, use_images=use_images))
             next_rewards.append(r)
             next_terminated.append(term)
             next_truncated.append(trunc)
+            current_returns[i] = current_returns[i] * ppo.gamma + r
             if term:
                 running_success_rates.append(1.0)
+                running_returns.append(current_returns[i])
+                current_returns[i] = 0.0
             elif trunc:
                 running_success_rates.append(0.0)
+                running_returns.append(current_returns[i])
+                current_returns[i] = 0.0
 
         rewards = torch.tensor(next_rewards, device=ppo.device, dtype=torch.float32)
         dones = torch.tensor(next_terminated, device=ppo.device, dtype=torch.bool) | torch.tensor(next_truncated, device=ppo.device, dtype=torch.bool)
+
+        if (step + 1) % 150000 == 0:
+            evaluate = True
+            for i in range(num_agents):
+                dones[i] = True  # force reset all envs for evaluation
 
         ppo.store_multiagent_transition(
             obs_list,
@@ -463,9 +619,6 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
         )
 
         obs_list = next_obs
-
-        if (step + 1) % 100000 == 0:
-            evaluate = True
         
         running_rewards.extend(next_rewards)
         running_values.extend(values_this_step)
@@ -473,13 +626,14 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
         running_throttle_values.extend(throttle_values_this_step)
         running_steer_values.extend(steer_values_this_step)
         running_reverse_values.extend(reverse_values_this_step)
-        avg_reward = np.mean(running_rewards[-1000:])
-        avg_value = np.mean(running_values[-1000:])
-        avg_log_prob = np.mean(running_log_probs[-1000:])
-        avg_throttle = np.mean(running_throttle_values[-1000:])
-        avg_steer = np.mean(running_steer_values[-1000:])
-        avg_reverse = np.mean(running_reverse_values[-1000:])
+        avg_reward = np.mean(running_rewards[-1024:])
+        avg_value = np.mean(running_values[-1024:])
+        avg_log_prob = np.mean(running_log_probs[-1024:])
+        avg_throttle = np.mean(running_throttle_values[-1024:])
+        avg_steer = np.mean(running_steer_values[-1024:])
+        avg_reverse = np.mean(running_reverse_values[-1024:])
         avg_success_rate = np.mean(running_success_rates[-100:]) if len(running_success_rates) > 0 else 0.0
+        average_return = np.mean(running_returns[-100:]) if len(running_returns) > 0 else 0.0
 
         if (step + 1) % 1000 == 0:
             writer.add_scalar("Control/AvgThrottle", avg_throttle, step)
@@ -489,6 +643,9 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
             writer.add_scalar("AvgValue", avg_value, step)
             writer.add_scalar("AvgLogProb", avg_log_prob, step)
             writer.add_scalar("AvgSuccessRate", avg_success_rate, step)
+            writer.add_scalar("AvgReturn", average_return, step)
+            current_lr = ppo.optimizer.param_groups[0]['lr']
+            writer.add_scalar("LearningRate", current_lr, step)
             log_to_file(f"step={step}, avg_reward={avg_reward:.4f}, avg_value={avg_value:.4f}, avg_log_prob={avg_log_prob:.4f}")
 
 
@@ -496,37 +653,46 @@ def train_multiagent(envs, ppo, img_size, num_agents=4, vel_mean=0, vel_std=1, a
 
         if ppo.ptr >= ppo.rollout_steps:
             ppo.compute_gae_multiagent(last_values=torch.tensor(values_this_step).to(ppo.device))
+            
+            # Learning rate decay: linearly decay from base_lr to 0.1 * base_lr over training
+            lr = ppo.base_lr * (1.0 - step / max_training_steps)
+            ppo.set_learning_rate(max(lr, ppo.base_lr * 0.1))  # floor at 0.1x base_lr
+            
             ppo.update()
             ppo.rollout = None
             episode += 1
 
-        reset_flag = False
-        for i in range(num_agents):
-            if dones[i] or reset_flag: # uf we perform an evaluation, reset all envs
-                if evaluate:
-                    evaluate = False
-                    reset_flag = True
-                    print("Evaluating...")
-                    avg_reward, avg_success_rate = ppo.evaluate(evaluate_steps=6000, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, env = envs[i], map_location=i)
-                    print(f"[EVAL] episode={episode} steps={step} avg_reward={avg_reward:.3f} avg_success_rate={avg_success_rate:.3f}")
-                    log_to_file(f"[EVAL] episode={episode}, step={step}, avg_reward={avg_reward:.4f}, avg_success_rate={avg_success_rate:.4f}")
+        if evaluate:
+            evaluate = False
+            print("Evaluating...")
+            env_num = np.random.randint(0, num_agents)
+            avg_reward, avg_success_rate = ppo.evaluate(evaluate_steps=10000, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, env = envs[env_num], map_location=env_num)
+            print(f"[EVAL] episode={episode} steps={step} avg_reward={avg_reward:.3f} avg_success_rate={avg_success_rate:.3f}")
+            log_to_file(f"[EVAL] episode={episode}, step={step}, avg_reward={avg_reward:.4f}, avg_success_rate={avg_success_rate:.4f}")
 
-                    torch.save({'model_state': ppo.policy.state_dict()},
-                        f"checkpoints/ppo_{episode}_no_image.pt")
-                    if (avg_success_rate >= best_success_rate):
-                        best_success_rate = avg_success_rate
-                        torch.save({'model_state': ppo.policy.state_dict()},
-                                f"checkpoints/ppo_multiagent_no_image_best.pt")
-                        print(f"New best model saved with avg_success_rate={best_success_rate:.3f}")
-                        log_to_file(f"[BEST] episode={episode}, step={step}, new_best_success_rate={best_success_rate:.4f}")
-                if not reset_flag:
-                    obs_list[i] = frame_to_tensordict(envs[i].reset(), img_size, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, use_images=use_images)
-        if reset_flag:
-            for i in range(num_agents):
+            torch.save({'model_state': ppo.policy.state_dict()},
+                f"checkpoints/ppo_{episode}_no_image.pt")
+            if (avg_success_rate >= best_success_rate):
+                best_success_rate = avg_success_rate
+                torch.save({'model_state': ppo.policy.state_dict()},
+                        f"checkpoints/ppo_multiagent_no_image_best.pt")
+                print(f"New best model saved with avg_success_rate={best_success_rate:.3f}")
+                log_to_file(f"[BEST] episode={episode}, step={step}, new_best_success_rate={best_success_rate:.4f}")
+
+            if avg_success_rate > 0.7:
+                print("Increasing difficulty...")
+                for i in range(num_agents):
+                    envs[i].difficulty = max(1, envs[i].difficulty + 0.1)
+
+        for i in range(num_agents):
+            if (dones[i]):
+                #envs[i].difficulty = step / max_training_steps  # difficulty should linearly scale between 0 and 1 from 0 to max_training_steps
                 obs_list[i] = frame_to_tensordict(envs[i].reset(), img_size, device=ppo.device, map_location=i, vel_mean=vel_mean, vel_std=vel_std, accel_mean=accel_mean, accel_std=accel_std, use_images=use_images)
+    
+        
 
 if __name__ == "__main__":
-    stats_path = "data/.norm_stats.json"
+    stats_path = "data_no_image/.norm_stats.json"
     with open(stats_path, 'r') as fh:
         stats = json.load(fh)
     vel_mean = torch.tensor(stats.get('vel_mean', [0.0, 0.0]), dtype=torch.float32)
@@ -540,30 +706,30 @@ if __name__ == "__main__":
     client.set_timeout(20.0)
     world = client.load_world('Town10HD')
 
-    max_steps = 2000
-    num_agents = 4
+    max_steps = 600
+    num_agents = 1
 
     use_images = False
 
-    checkpoint_filepath = "checkpoints/ppo_100_no_image.pt"
-    policy = TruckNet(pretrained=False, use_images=use_images).to(device)
+    checkpoint_filepath = "checkpoints/ppo_1757_no_image.pt"  # or None
+    policy = TruckNet().to(device)
     if checkpoint_filepath is not None:
         ckpt = torch.load(checkpoint_filepath, map_location=device)
         state = ckpt.get('model_state', ckpt)
         policy.load_state_dict(state)
-        with torch.no_grad():
-            policy.log_std.fill_(-0.5)        
+        # with torch.no_grad():
+        #     policy.log_std.fill_(-0.5)        
         print(f"Loaded policy from {checkpoint_filepath}")
 
     policy.to(device)        
 
-    envs = [TruckEnv(max_steps=max_steps, world=world, phase=1, map_location=i, use_cameras=use_images) for i in range(num_agents)]
+    envs = [TruckEnv(max_steps=max_steps, world=world, phase=2, map_location=i, use_cameras=use_images) for i in range(num_agents)]
     ppo = PPOMultiAgent(
         device=device,
         num_agents=num_agents,
         use_images=use_images,
-        minibatch_size=64,
-        rollout_steps=1000, 
+        minibatch_size=16,
+        rollout_steps=600, 
         policy=policy
     )
 
@@ -576,5 +742,6 @@ if __name__ == "__main__":
         vel_std=vel_std,
         accel_mean=accel_mean,
         accel_std=accel_std,
-        use_images=use_images
+        use_images=use_images,
+        warmup=False
     )

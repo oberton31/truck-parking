@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torchvision.transforms as T
-from model import TruckNet
+from modelv2 import TruckNet
 from env import TruckEnv
 
 # Optional OpenCV-based visualizer for actions (used when --gui is passed)
@@ -199,7 +199,7 @@ def run_loop(args):
     for i, env in enumerate(envs):
         obs_env[i] = env.reset()
 
-    model = TruckNet(pretrained=args.pretrained, use_images=False)
+    model = TruckNet()
     model.to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device)
@@ -237,14 +237,12 @@ def run_loop(args):
             rev_t = rev_t.to(device)
 
             with torch.no_grad():
-                cont_logits, bern_logits, logvar, _ = model(pos_rel, vel_t, accel_t, trailer_t, rev_t, None)
-
+                cont_logits, bern_logits, logvar, _ = model(pos_rel, vel_t, accel_t, trailer_t, rev_t)
             cont_env = torch.tanh(cont_logits)
             cont_env = cont_env.cpu().numpy().squeeze(0)  # (3,)
-            cont_env[1] *= 2
             throttle = cont_env[0]
-            steer = cont_env[1]
-            # if (step < 100): throttle = 1
+            steer = cont_env[1] * 2
+            # if (step < 50): throttle = 0.1
             # else: throttle = float(np.clip(mean[0], 0.0, 1.0))
             # brake = float(np.clip(mean[1], 0.0, 1.0))
             # if (brake < 0.1): brake = 0.0
@@ -255,14 +253,18 @@ def run_loop(args):
             #print(brake)
 
 
-            rev_toggle = bool(torch.sigmoid(bern_logits[0]).squeeze(0) >= 0.5)
+            rev_toggle = torch.sigmoid(bern_logits[0]).squeeze(0)
+            rev_toggle = rev_toggle.cpu().numpy()
+
             # handbrake = bool(mean[4] >= 0.5)
             # handbrake = False
 
             # if (rev_toggle):
             #     print("TOGGLED GEAR")
             action = [throttle, steer, rev_toggle]
-            #print(action)
+            if (step % 100 == 0):
+                print(f"Step {step}: Action: throttle={throttle:.3f}, steer={steer:.3f}, rev={rev_toggle:.3f}")
+            #print(action)``
             if vis is not None:
                 try:
                     _update_visualizer_cv(vis, action)
@@ -271,20 +273,22 @@ def run_loop(args):
 
             env.apply_control(action)
             
-            env.world.tick()  # advance the shared world once per step
+            for _ in range(2):
+                env.world.tick()  # advance the shared world once per step
             #time.sleep(0.05)
             # for i, env in enumerate(envs):
             next_obs, reward, terminated, truncated = env.get_observation()
             obs_env[0] = next_obs
 
             if terminated or truncated:
+                print(f"Step {step}: Episode done (terminated={terminated}, truncated={truncated})")
                 print("Episode finished, resetting env")
                 obs_env[0] = env.reset()
             step += 1
             #print(f"Step {step} completed")
-            if args.max_steps is not None and step >= args.max_steps:
-                print("Reached max steps, exiting")
-                break
+            # if args.max_steps is not None and step >= args.max_steps:
+            #     print("Reached max steps, exiting")
+            #     break
 
     except KeyboardInterrupt:
         print("Keyboard interrupt, shutting down")
@@ -305,7 +309,7 @@ def main():
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--pretrained', action='store_true')
     parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--max_steps', type=int, default=10000)
+    parser.add_argument('--max_steps', type=int, default=1000)
     parser.add_argument('--stats', type=str, default=None, help='Optional path to .norm_stats.json used for vel/accel normalization')
     parser.add_argument('--phase', type=int, default=1, help='Env phase (collision penalties)')
     parser.add_argument('--gui', action='store_true', help='Enable action visualizer GUI (OpenCV)')

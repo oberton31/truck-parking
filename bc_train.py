@@ -25,7 +25,7 @@ import json
 import tempfile
 
 # from py import log
-from model import TruckNet
+from modelv2 import TruckNet
 import cv2 as cv
 
 WORKSPACE_BOUNDS = np.array([-69, 157, -30, 200]) # xmin, xmax, ymin, ymax
@@ -458,180 +458,279 @@ class NpzFramesDataset(Dataset):
 
 
 class NoImageDataset(Dataset):
-    def __init__(self, data_dir):
+    def __init__(
+        self,
+        datadir: str,
+        maxfiles: int = None,
+        high_throttle_thresh: float = 0.05,
+        high_throttle_frac: float = 0.4,
+    ):
         """
+        No-image dataset that oversamples frames with large throttle.
+
         Args:
-            data_dir (str): Path to the directory containing the .npz files.
+            datadir: Path to directory containing .npz files.
+            maxfiles: Optional cap on number of files.
+            high_throttle_thresh: |throttle| > this is considered "high".
+            high_throttle_frac: Probability of sampling from high-throttle set.
         """
-        self.data_dir = Path(data_dir)
-        files = sorted(self.data_dir.rglob('*.npz'))
+        self.datadir = Path(datadir)
+        files = sorted(self.datadir.rglob("*.npz"))
+        if maxfiles is not None:
+            files = files[:maxfiles]
         self.files = [str(f) for f in files]
-        
-        # Load the normalization stats file
-        self._stats_path = self.data_dir / '.norm_stats.json'
+
+        self.statspath = self.datadir / ".norm_stats.json"
         self.stats = None
-        if self._stats_path.exists():
+        if self.statspath.exists():
             try:
-                with open(self._stats_path, 'r') as fh:
+                with open(self.statspath, "r") as fh:
                     self.stats = json.load(fh)
             except Exception as e:
-                print(f"Warning: Failed to load normalization stats: {e}")
+                print("Warning: Failed to load normalization stats", e)
                 self.stats = None
 
+        self.posindices = np.array([0, 1, 4])
+        self.velindices = np.array([0, 1])
+        self.goalindices = np.array([0, 1, 4])
+        self.accelindices = np.array([0, 1])
 
-        self.pos_indices = np.array([0, 1, 4])
-        self.vel_indices = np.array([0, 1])
-        self.goal_indices = np.array([0, 1, 4])
-        self.accel_indices = np.array([0, 1])
-
-        # If no stats found, compute them
         if self.stats is None:
-            self.stats = self._compute_stats()
+            self.stats = self.computestats()
 
-    def _compute_stats(self):
-        # Streaming computation of mean and std for selected indices
-        pos_sum = np.zeros(len(self.pos_indices), dtype=np.float64)
-        pos_sumsq = np.zeros(len(self.pos_indices), dtype=np.float64)
-        vel_sum = np.zeros(len(self.vel_indices), dtype=np.float64)
-        vel_sumsq = np.zeros(len(self.vel_indices), dtype=np.float64)
-        accel_sum = np.zeros(len(self.accel_indices), dtype=np.float64)
-        accel_sumsq = np.zeros(len(self.accel_indices), dtype=np.float64)
-        goal_sum = np.zeros(len(self.goal_indices), dtype=np.float64)
-        goal_sumsq = np.zeros(len(self.goal_indices), dtype=np.float64)
-        count = 0
-
-        # Loop through files and calculate stats
-        for f in tqdm(self.files, desc='Computing normalization stats'):
+        # Build flat index of (file, localidx)
+        self.index = []
+        for f in tqdm(self.files, desc="Indexing NoImageDataset"):
             try:
                 with np.load(f, allow_pickle=True) as d:
-                    frames = d['frames']
+                    frames = d["frames"]
+                    n = len(frames)
+            except Exception as e:
+                print(f"Warning: failed to read {f}: {e}")
+                n = 0
+            for i in range(n):
+                self.index.append((f, i))
+
+        # Oversampling metadata
+        self.high_throttle_thresh = float(high_throttle_thresh)
+        self.high_throttle_frac = float(high_throttle_frac)
+
+        # Build high/low throttle index lists
+        self.high_idx = []
+        self.low_idx = []
+        for global_idx, (fpath, localidx) in enumerate(
+            tqdm(self.index, desc="Scanning throttle for oversampling")
+        ):
+            try:
+                with np.load(fpath, allow_pickle=True) as d:
+                    frames = d["frames"]
+                    fr = frames[localidx]
+                    if isinstance(fr, np.ndarray) and fr.dtype == object:
+                        fr = fr.item()
+                    actions = np.array(fr["actions"], dtype=np.float32)
+                    throttle = float(actions[0])
+            except Exception:
+                # If anything goes wrong, just treat as low-throttle
+                self.low_idx.append(global_idx)
+                continue
+
+            if throttle > self.high_throttle_thresh:
+                self.high_idx.append(global_idx)
+            else:
+                self.low_idx.append(global_idx)
+
+        print(
+            f"NoImageDataset: total={len(self.index)}, "
+            f"high_throttle={len(self.high_idx)}, low_throttle={len(self.low_idx)}, "
+            f"high_frac={self.high_throttle_frac}"
+        )
+
+    def computestats(self):
+        possum = np.zeros(len(self.posindices), dtype=np.float64)
+        possumsq = np.zeros(len(self.posindices), dtype=np.float64)
+        velsum = np.zeros(len(self.velindices), dtype=np.float64)
+        velsumsq = np.zeros(len(self.velindices), dtype=np.float64)
+        accelsum = np.zeros(len(self.accelindices), dtype=np.float64)
+        accelsumsq = np.zeros(len(self.accelindices), dtype=np.float64)
+        goalsum = np.zeros(len(self.goalindices), dtype=np.float64)
+        goalsumsq = np.zeros(len(self.goalindices), dtype=np.float64)
+        count = 0
+
+        for f in tqdm(self.files, desc="Computing normalization stats"):
+            try:
+                with np.load(f, allow_pickle=True) as d:
+                    frames = d["frames"]
                     for fr in frames:
                         if isinstance(fr, np.ndarray) and fr.dtype == object:
                             fr = fr.item()
-                        # Collecting the relevant fields
-                        pr_arr = np.array(fr.get('pos', [0, 0, 0, 0]), dtype=np.float32)
-                        vr_arr = np.array(fr.get('vel', [0, 0]), dtype=np.float32)
-                        ar_arr = np.array(fr.get('accel', [0, 0]), dtype=np.float32)
-                        gr_arr = np.array(fr.get('goal', [0, 0, 0]), dtype=np.float32)
 
-                        pos_sum += pr_arr
-                        pos_sumsq += pr_arr * pr_arr
-                        vel_sum += vr_arr
-                        vel_sumsq += vr_arr * vr_arr
-                        accel_sum += ar_arr
-                        accel_sumsq += ar_arr * ar_arr
-                        goal_sum += gr_arr
-                        goal_sumsq += gr_arr * gr_arr
+                        pr = fr.get("pos", None)
+                        vr = fr.get("vel", None)
+                        ar = fr.get("accel", None)
+                        gr = fr.get("goal", None)
+
+                        prarr = np.array(pr, dtype=np.float32).ravel()
+                        vrarr = np.array(vr, dtype=np.float32).ravel()
+                        ararr = np.array(ar, dtype=np.float32).ravel()
+                        grarr = np.array(gr, dtype=np.float32).ravel()
+
+                        pvals = np.array(
+                            [
+                                float(prarr[idx]) if idx < prarr.size else 0.0
+                                for idx in self.posindices
+                            ],
+                            dtype=np.float64,
+                        )
+                        vvals = np.array(
+                            [
+                                float(vrarr[idx]) if idx < vrarr.size else 0.0
+                                for idx in self.velindices
+                            ],
+                            dtype=np.float64,
+                        )
+                        avals = np.array(
+                            [
+                                float(ararr[idx]) if idx < ararr.size else 0.0
+                                for idx in self.accelindices
+                            ],
+                            dtype=np.float64,
+                        )
+                        gvals = np.array(
+                            [
+                                float(grarr[idx]) if idx < grarr.size else 0.0
+                                for idx in self.goalindices
+                            ],
+                            dtype=np.float64,
+                        )
+
+                        possum += pvals
+                        possumsq += pvals * pvals
+                        velsum += vvals
+                        velsumsq += vvals * vvals
+                        accelsum += avals
+                        accelsumsq += avals * avals
+                        goalsum += gvals
+                        goalsumsq += gvals * gvals
                         count += 1
             except Exception:
                 continue
 
-        # Compute mean and std for each of the fields
-        def compute_mean_std(sum_arr, sumsq_arr):
-            mean = sum_arr / count
-            var = (sumsq_arr / count) - np.square(mean)
-            std = np.sqrt(np.maximum(var, 1e-6))
-            return mean.tolist(), std.tolist()
+        count = max(count, 1)
+        posmean = (possum / count).tolist()
+        posvar = possumsq / count - np.square(np.array(posmean, dtype=np.float64))
+        posstd = np.sqrt(np.maximum(posvar, 1e-6)).tolist()
 
-        pos_mean, pos_std = compute_mean_std(pos_sum, pos_sumsq)
-        vel_mean, vel_std = compute_mean_std(vel_sum, vel_sumsq)
-        accel_mean, accel_std = compute_mean_std(accel_sum, accel_sumsq)
-        goal_mean, goal_std = compute_mean_std(goal_sum, goal_sumsq)
+        velmean = (velsum / count).tolist()
+        velvar = velsumsq / count - np.square(np.array(velmean, dtype=np.float64))
+        velstd = np.sqrt(np.maximum(velvar, 1e-6)).tolist()
 
-        # Include ImageNet stats for RGB
-        rgb_mean = [0.485, 0.456, 0.406]
-        rgb_std = [0.229, 0.224, 0.225]
+        accelmean = (accelsum / count).tolist()
+        accelvar = accelsumsq / count - np.square(np.array(accelmean, dtype=np.float64))
+        accelstd = np.sqrt(np.maximum(accelvar, 1e-6)).tolist()
 
-        return {
-            'pos_mean': pos_mean,
-            'pos_std': pos_std,
-            'vel_mean': vel_mean,
-            'vel_std': vel_std,
-            'accel_mean': accel_mean,
-            'accel_std': accel_std,
-            'goal_mean': goal_mean,
-            'goal_std': goal_std,
-            'rgb_mean': rgb_mean,
-            'rgb_std': rgb_std,
-        }
+        goalmean = (goalsum / count).tolist()
+        goalvar = goalsumsq / count - np.square(np.array(goalmean, dtype=np.float64))
+        goalstd = np.sqrt(np.maximum(goalvar, 1e-6)).tolist()
+
+        stats = dict(
+            pos_mean=posmean,
+            pos_std=posstd,
+            vel_mean=velmean,
+            vel_std=velstd,
+            accel_mean=accelmean,
+            accel_std=accelstd,
+            goal_mean=goalmean,
+            goal_std=goalstd,
+        )
+        try:
+            with open(self.statspath, "w") as fh:
+                json.dump(stats, fh)
+        except Exception as e:
+            print("Warning failed to save normalization stats", e)
+        return stats
 
     def __len__(self):
-        """Returns the total number of frames in the dataset."""
-        return len(self.files)
+        return len(self.index)
+
+    def _load_frame(self, idx):
+        fpath, localidx = self.index[idx]
+        with np.load(fpath, allow_pickle=True) as d:
+            frames = d["frames"]
+            frame = frames[localidx]
+        if isinstance(frame, np.ndarray) and frame.dtype == object:
+            frame = frame.item()
+        return frame
 
     def __getitem__(self, idx):
-        """Returns the data (no images) for a single frame."""
-        file_path = self.files[idx]
-        try:
-            with np.load(file_path, allow_pickle=True) as d:
-                frames = d['frames']
-                frame = frames[0]  # Assuming we need the first frame in the chunk (modify this if needed)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load frame from {file_path}: {e}")
+        # Decide whether to sample from high- or low-throttle pool
+        use_high = (
+            np.random.rand() < self.high_throttle_frac and len(self.high_idx) > 0
+        )
+        if use_high:
+            idx = int(np.random.choice(self.high_idx))
+        elif len(self.low_idx) > 0:
+            idx = int(np.random.choice(self.low_idx))
+        # else: fall back to given idx if one of the lists is empty
 
-        # Extract actions and positional data
-        actions = np.array(frame['actions'], dtype=np.float32)
-        actions_t = actions = torch.from_numpy(actions)
-        pos_raw = frame.get('pos', None)
-        vel_raw = frame.get('vel', None)
-        accel_raw = frame.get('accel', None)
-        goal_raw = frame.get('goal', None)
+        frame = self._load_frame(idx)
 
+        actions = np.array(frame["actions"], dtype=np.float32)
+        actions = torch.from_numpy(actions)
 
+        posraw = frame.get("pos", None)
+        velraw = frame.get("vel", None)
+        accelraw = frame.get("accel", None)
+        goalraw = frame.get("goal", None)
+        trailerangleraw = frame.get("trailer_angle", None)
+        revraw = frame.get("reverse", None)
 
-        # Normalize position
-        pos_sel = []
-        for i in self.pos_indices:
-            pos_sel.append(float(pos_raw[i]))
-        pos_arr = np.array(pos_sel, dtype=np.float32)
-        pos_t = torch.tensor(pos_arr, dtype=torch.float32)
-        pos_t[:2] = 2 * (pos_t[:2] - WORKSPACE_BOUNDS[[0, 2]]) / (WORKSPACE_BOUNDS[[1, 3]] - WORKSPACE_BOUNDS[[0, 2]]) - 1
-        pos_t[2] = pos_t[2] / 180  # Normalize yaw
+        # position
+        posarr = np.array(posraw, dtype=np.float32).ravel()
+        pos_sel = [float(posarr[i]) for i in self.posindices]
+        post = torch.tensor(pos_sel, dtype=torch.float32)
 
-        # Normalize velocity
-        vel_sel = []
-        for i in self.vel_indices:
-            vel_sel.append(float(vel_raw[i]))
-        vel_arr = np.array(vel_sel, dtype=np.float32)
-        vel_t = torch.tensor(vel_arr, dtype=torch.float32)
-        vel_t = (vel_t - torch.tensor(self.stats['vel_mean'][:2], dtype=torch.float32)) / torch.tensor(self.stats['vel_std'][:2], dtype=torch.float32)
+        # normalize velocity
+        vel_sel = [float(velraw[i]) for i in self.velindices]
+        velarr = np.array(vel_sel, dtype=np.float32)
+        velt = torch.tensor(velarr, dtype=torch.float32)
+        velt = (
+            velt
+            - torch.tensor(self.stats["vel_mean"][:2], dtype=torch.float32)
+        ) / torch.tensor(self.stats["vel_std"][:2], dtype=torch.float32)
 
-        # Normalize acceleration
-        accel_sel = []
-        for i in self.accel_indices:
-            accel_sel.append(float(accel_raw[i]))
-        accel_arr = np.array(accel_sel, dtype=np.float32)
-        accel_t = torch.tensor(accel_arr, dtype=torch.float32)
-        accel_t = (accel_t - torch.tensor(self.stats['accel_mean'][:2], dtype=torch.float32)) / torch.tensor(self.stats['accel_std'][:2], dtype=torch.float32)
+        # normalize accel
+        accel_sel = [float(accelraw[i]) for i in self.accelindices]
+        accelarr = np.array(accel_sel, dtype=np.float32)
+        accelt = torch.tensor(accelarr, dtype=torch.float32)
+        accelt = (
+            accelt
+            - torch.tensor(self.stats["accel_mean"][:2], dtype=torch.float32)
+        ) / torch.tensor(self.stats["accel_std"][:2], dtype=torch.float32)
 
-        # Normalize goal
-        goal_sel = []
-        for i in self.goal_indices:
-            goal_sel.append(float(goal_raw[i]))
-            
-        goal_arr = np.array(goal_sel, dtype=np.float32)
-        goal_t = torch.tensor(goal_arr, dtype=torch.float32)
-        goal_t[:2] = 2 * (goal_t[:2] - WORKSPACE_BOUNDS[[0, 2]]) / (WORKSPACE_BOUNDS[[1, 3]] - WORKSPACE_BOUNDS[[0, 2]]) - 1
-        goal_t[2] = goal_t[2] / 180  # Normalize yaw
+        # goal
+        goalsel = [float(goalraw[i]) for i in self.goalindices]
+        goalarr = np.array(goalsel, dtype=np.float32)
+        goalt = torch.tensor(goalarr, dtype=torch.float32)
+        # apply workspace normalization if you use it elsewhere
+        # (reuse your existing WORKSPACEBOUNDS logic here)
 
-        # Trailer Angle
-        trailer_angle_raw = frame.get('trailer_angle', None)
-        if trailer_angle_raw is None:
-            raise Exception("trailer_angle data not found")
-        trailer_angle_arr = np.array(trailer_angle_raw, dtype=np.float32).ravel()
-        # ensure trailer angle is a 1-D tensor of length 1 so stacking yields (B,1)
-        ta_val = float(trailer_angle_arr[0]) if trailer_angle_arr.size > 0 else 0.0
-        trailer_angle_t = torch.tensor([ta_val], dtype=torch.float32)
-        trailer_angle_t /= 180.0  # scale to [-1, 1]
+        # trailer angle
+        traileranglearr = np.array(trailerangleraw, dtype=np.float32).ravel()
+        #print(traileranglearr)
+        taval = float(traileranglearr[0]) if traileranglearr.size > 0 else 0.0
+        traileranglet = torch.tensor([taval / 180.0], dtype=torch.float32)
 
-        # Reverse
-        rev_raw = frame.get('reverse', None)
-        if rev_raw is None:
-            raise Exception("reverse data not found")
-        # ensure reverse flag is 1-D tensor (B,1) after stacking
-        rev_t = torch.tensor([float(rev_raw)], dtype=torch.float32)
+        # trailer_angle_arr = np.array(trailerangleraw, dtype=np.float32).ravel()
+        # # ensure trailer angle is a 1-D tensor of length 1 so stacking yields (B,1)
+        # ta_val = float(trailer_angle_arr[0]) if trailer_angle_arr.size > 0 else 0.0
+        # trailer_angle_t = torch.tensor([ta_val], dtype=torch.float32)
+        # trailer_angle_t /= 180.0  # scale to [-1, 1]
 
-        return actions, pos_t, vel_t, accel_t, trailer_angle_t, rev_t, goal_t
+        # reverse flag
+        revt = torch.tensor([float(revraw)], dtype=torch.float32)
+
+        return actions, post, velt, accelt, traileranglet, revt, goalt
+
     
 def collate_fn_no_image(batch):
     # Expect each element to be (imgs, actions, pos, vel, accel, trailer_angle, reverse, goal)
@@ -706,6 +805,7 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
             imgs = imgs.to(device, non_blocking=True)
         else:
             imgs = None
+
         actions = actions.to(device, non_blocking=True)
         poss = poss.to(device, non_blocking=True)
         vels = vels.to(device, non_blocking=True)
@@ -717,30 +817,35 @@ def train_epoch(model, loader, optim, device, desc=None, writer=None, global_ste
         # forward/backward (optionally with AMP)
         from contextlib import nullcontext
         ctx = nullcontext()
-
+        #print(f"Pos: {goals-poss}, Vel: {vels}, Accel: {accels}, Trailer Angle: {trailer_angles}, Revs: {revs}")
         with ctx:
-            cont_logits, bern_logits, log_std, value = model(goals-poss, vels, accels, trailer_angles, revs, imgs)
+            cont_logits, bern_logits, log_std, value = model(goals-poss, vels, accels, trailer_angles, revs)
 
         # print(f"cont_logits: {cont_logits.shape}, bern_logits: {bern_logits.shape}, log_std: {log_std.shape}")
 
         cont_env = torch.tanh(cont_logits)
         cont_env = cont_env * torch.tensor([1.0, 2.0], device=cont_env.device)  # broadcast-safe scaling
         std = log_std.exp()
+        #print(cont_env)
+        
         normal = torch.distributions.Normal(cont_env, std)
         actions_env = torch.zeros((actions.shape[0], 2), device=device)
-        actions_env[:, 0] = actions[:, 0] - actions[:, 1] # throttle - brake
-        actions_env[:, 1] = actions[:, 2] # steering
+        actions_env[:, 0:2] = actions[:, 0:2] 
         # print(f"actions_env: {actions_env.shape}")
         logp_cont = normal.log_prob(actions_env)
         logp_cont = logp_cont.sum(dim=1)
 
-        bin_target = actions[:, 3:4]  # binary target for reverse
+        bin_target = actions[:, 2:3]  # binary target for reverse
         bin_prob = torch.sigmoid(bern_logits[:, 0])
         logp_bin = torch.distributions.Bernoulli(probs=bin_prob).log_prob(bin_target)
         logp_bin = logp_bin.sum(dim=1)
 
         logp = logp_cont + logp_bin
-        loss = -logp.mean()
+
+        pred_throttle = cont_env[:, 0]
+
+        brake_penalty = torch.relu(-pred_throttle) 
+        loss = -logp.mean() + 0.3 * brake_penalty.mean()
         # print(f"loss: {loss.item()}")
         optim.zero_grad()
         loss.backward()
@@ -804,25 +909,27 @@ def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0
             ctx = nullcontext()
 
             with ctx:
-                cont_logits, bern_logits, log_std, value = model(goals-poss, vels, accels, trailer_angles, revs, imgs)
+                cont_logits, bern_logits, log_std, value = model(goals-poss, vels, accels, trailer_angles, revs)
 
             cont_env = torch.tanh(cont_logits)
             cont_env = cont_env * torch.tensor([1.0, 2.0], device=cont_env.device)  # broadcast-safe scaling
             normal = torch.distributions.Normal(cont_env, torch.exp(log_std))
             
             actions_env = torch.zeros((actions.shape[0], 2), device=device)
-            actions_env[:, 0] = actions[:, 0] - actions[:, 1] # throttle - brake
-            actions_env[:, 1] = actions[:, 2] # steering
+            actions_env[:, 0:2] = actions[:, 0:2] 
             logp_cont = normal.log_prob(actions_env)
             logp_cont = logp_cont.sum(dim=1)
 
-            bin_target = actions[:, 3:4]  # binary target for reverse
+            bin_target = actions[:, 2:3]  # binary target for reverse
             bin_prob = torch.sigmoid(bern_logits[:, 0])
             logp_bin = torch.distributions.Bernoulli(probs=bin_prob).log_prob(bin_target)
             logp_bin = logp_bin.sum(dim=1)
 
             logp = logp_cont + logp_bin
-            loss = -logp.mean()
+            pred_throttle = cont_env[:, 0]
+
+            brake_penalty = torch.relu(-pred_throttle) 
+            loss = -logp.mean() + 0.3 * brake_penalty.mean()
 
             batch_size = actions.shape[0]
             #batch_size = imgs.shape[0]
@@ -847,7 +954,7 @@ def eval_epoch(model, loader, device, desc=None, writer=None, global_step_base=0
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='data', help='path to data root containing timestamp folders')
+    parser.add_argument('--data_dir', type=str, default='data_no_image', help='path to data root containing timestamp folders')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -917,7 +1024,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = TruckNet(pretrained=args.pretrained, use_images=use_images).to(device)
+    model = TruckNet().to(device)
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint, map_location=device)
         state = ckpt.get('model_state', ckpt)
@@ -961,12 +1068,12 @@ def main():
                 'optim_state': optimizer.state_dict(),
                 'args': vars(args),
             }
-            ckpt_path = os.path.join(args.save_dir, f"bc_epoch_{epoch:03d}_no_image.pt")
-            torch.save(ckpt, ckpt_path)
+            # ckpt_path = os.path.join(args.save_dir, f"bc_epoch_{epoch:03d}_no_image.pt")
+            # torch.save(ckpt, ckpt_path)
 
             if val_loss < best_val:
                 best_val = val_loss
-                best_path = os.path.join(args.save_dir, 'best_no_image.pt')
+                best_path = os.path.join(args.save_dir, 'best_no_image_v2.pt')
                 torch.save(ckpt, best_path)
     except Exception as e:
         print(f"Error: {str(e)}")
