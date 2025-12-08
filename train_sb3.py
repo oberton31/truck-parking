@@ -104,10 +104,10 @@ def make_env(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train PPO agent on truck parking (SB3).")
-    parser.add_argument("--total-steps", type=int, default=1_000_000, help="Total training timesteps.")
+    parser.add_argument("--total-steps", type=int, default=10_000_000, help="Total training timesteps.")
     parser.add_argument("--n-steps", type=int, default=2048, help="Rollout steps per update.")
     parser.add_argument("--batch-size", type=int, default=256, help="PPO batch size.")
-    parser.add_argument("--learning-rate", type=float, default=3e-4, help="PPO learning rate.")
+    parser.add_argument("--learning-rate", type=float, default=5e-5, help="PPO learning rate.")
     parser.add_argument("--phase2-step", type=int, default=250_000, help="When to start curriculum phase 2.")
     parser.add_argument("--phase3-step", type=int, default=500_000, help="When to start curriculum phase 3.")
     parser.add_argument("--max-episode-steps", type=int, default=1000, help="Episode cap (matching paper).")
@@ -149,13 +149,14 @@ def main():
                 learning_rate=args.learning_rate,
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
-                gamma=0.99,
+                gamma=0.999,
                 gae_lambda=0.95,
-                clip_range=0.1,
+                clip_range=0.2,
                 ent_coef=0.001,
                 verbose=1,
                 policy_kwargs=policy_kwargs,
                 tensorboard_log=tb_log_dir,
+                vf_coef=0.2,
             )
             ckpt = torch.load(args.bc_init, map_location="cpu")
             state = (
