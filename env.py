@@ -26,7 +26,7 @@ import math
 SHOW_PREVIEW = False
 IM_WIDTH = 640
 IM_HEIGHT = 480
-RENDER_CARLA = True # SET TO FALSE FOR TRAINING
+RENDER_CARLA = False # SET TO FALSE FOR TRAINING
 
 class TruckEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -77,25 +77,26 @@ class TruckEnv:
         self.max_steps = max_steps
         self.curr_steps = 0
 
-        self.action_ndim = 3 # If change action space, need to change this
+        self.action_ndim = 4 # If change action space, need to change this
 
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05  # 20 Hz control steps
         settings.no_rendering_mode = not RENDER_CARLA
+        settings.use_deterministic_ragdolls = True
         self.world.apply_settings(settings)
 
         self.goal_pos = None
         self.difficulty = 0.0 # 0 is easiest, 1 is hardest
-        self.min_difficulty = 1.0
-        self.max_difficulty = 8.0
+        self.min_difficulty = 0.5
+        self.max_difficulty = 6.0
 
         self.goal_points = [
-            # (carla.Transform(carla.Location(-43.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Right"),
+            (carla.Transform(carla.Location(-43.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Right"),
             (carla.Transform(carla.Location(-54, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Center"),
             # (carla.Transform(carla.Location(-63.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Left"),
-            # (carla.Transform(carla.Location(-43.5, 182.5, 1), carla.Rotation(0, -180, 0)), "Right Top"),
-            # (carla.Transform(carla.Location(-43.5, 192.5, 1), carla.Rotation(0, -180, 0)), "Right Bottom")
+            (carla.Transform(carla.Location(-43.5, 182.5, 1), carla.Rotation(0, -180, 0)), "Right Top"),
+            (carla.Transform(carla.Location(-43.5, 192.5, 1), carla.Rotation(0, -180, 0)), "Right Bottom")
         ]
 
         self.goal_idx = goal_idx
@@ -159,15 +160,18 @@ class TruckEnv:
             #print(f"Spawn point: ({spawn_point.location.x}, {spawn_point.location.y}, {spawn_point.location.z})")
             # --------------------------------------------------------------
             # Adjust spawn rotation based on difficulty
-            spawn_point.rotation.yaw += self.difficulty * 20.0  # Scale yaw rotation with difficulty (0-45 degrees)
+            #spawn_point.rotation.yaw += self.difficulty * 20.0  # Scale yaw rotation with difficulty (0-45 degrees)
             # Training regimen: start near the goal
             if rand_goal_name in ["Bottom Right", "Bottom Center", "Bottom Left"]:
-                spawn_point.location.y -= 15 #+ np.random.uniform(-3, 3)
-                width = self.difficulty * (self.max_difficulty - self.min_difficulty) + self.min_difficulty
-                spawn_point.location.x += np.random.uniform(-width, width) # scale this up later
+                spawn_point.location.y -= self.difficulty * (18 - 3) + 3 + np.random.uniform(-2, 2)
+                max_width = self.difficulty * (self.max_difficulty - self.min_difficulty) + self.min_difficulty
+                u = np.random.uniform(-1, 1)
+                spawn_point.location.x += np.sign(u) * (np.abs(u) ** (1/2)) * max_width # scale this up later
             else:
-                spawn_point.location.x -= 12 #+ np.random.uniform(-3, 3)
-                spawn_point.location.y += np.random.uniform(-7, 7)
+                spawn_point.location.x -= self.difficulty * (18 - 3) + 3 + np.random.uniform(-2, 2)
+                max_width = self.difficulty * (self.max_difficulty - self.min_difficulty) + self.min_difficulty
+                u = np.random.uniform(-1, 1)
+                spawn_point.location.y += np.sign(u) * (np.abs(u) ** (1/2)) * max_width # scale this up later
 
         
 
@@ -239,19 +243,26 @@ class TruckEnv:
         assert(len(action) == self.action_ndim), f"Expected action of length {self.action_ndim}, got {len(action)}"
         self.curr_steps += 1
 
-        self.control.steer = float(action[1])
+        self.control.steer = float(action[2])
 
-        if (float(action[0]) < 0):
-            if (float(action[0]) > -0.02): # deadzone for brake
-                self.control.brake = 0.0
-            else:
-                self.control.brake = -float(action[0])
-            self.control.throttle = 0.0
+        # if (float(action[0]) < 0):
+        #     if (float(action[0]) > -0.02): # deadzone for brake
+        #         self.control.brake = 0.0
+        #     else:
+        #         self.control.brake = -float(action[0])
+        #     self.control.throttle = 0.0
+        # else:
+        #     self.control.throttle = float(action[0])
+        #     self.control.brake = 0.0
+        self.control.throttle = float(action[0])
+
+        if (float(action[1]) < 0.1):
+            self.control.brake = 0
         else:
-            self.control.throttle = float(action[0])
-            self.control.brake = 0.0
+            self.control.brake = float(action[1])
 
-        self.control.reverse = bool(action[2] > 0.5) # action is now 1 if reverse, 0 otherwise
+
+        self.control.reverse = bool(action[3] > 0.5) # action is now 1 if reverse, 0 otherwise
 
         self.player.apply_control(self.control)
 
@@ -402,11 +413,15 @@ class TruckEnv:
         goal_list = [self.goal_pos.location.x, self.goal_pos.location.y, self.goal_pos.location.z, self.goal_pos.rotation.pitch, self.goal_pos.rotation.yaw, self.goal_pos.rotation.roll]
         goal_list[0] += (11000*self.map_location) / 100
 
-        if self.use_cameras:
-            obs = (self.image_list, pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
-        else:
-            obs = (pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list)
+        cab_rays = self._compute_rays_from_transform(self.player.get_transform())
+        trailer_rays = self._compute_rays_from_transform(self.playerTrailer.get_transform())
 
+        ray_obs = np.concatenate([cab_rays, trailer_rays])  # final ray observation
+
+        if self.use_cameras:
+            obs = (self.image_list, pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list, ray_obs)
+        else:
+            obs = (pos_list, vel_list, accel_list, trailer_angle, self.control.reverse, goal_list, ray_obs)
         if RENDER_CARLA and self.curr_steps % 100 == 0:
             print(f"Step: {self.curr_steps}, Reward: {reward:.3f}, Pos: ({pos.location.x:.2f}, {pos.location.y:.2f}), Dist to Goal: {dist_to_goal:.2f}, Yaw: {pos.rotation.yaw:.2f}, Yaw Diff: {yaw_diff:.2f}, Trailer Angle: {trailer_angle:.2f}, Collision: {collision}")
 
@@ -463,6 +478,66 @@ class TruckEnv:
             return True
         else:
             return False
+
+    def _compute_rays_from_transform(self, transform, actor, ray_length=20.0):
+        """
+        Cast rays from a transform while avoiding self-collision.
+
+        Args:
+            transform: CARLA Transform of the actor (player or trailer).
+            actor: The vehicle actor to get bounding box extents.
+            ray_length: Maximum length of each ray.
+
+        Returns:
+            np.ndarray of distances in 4 directions: [front, back, left, right]
+        """
+        # import math
+        # import numpy as np
+        # import carla
+
+        # Bounding box extents
+        extent = actor.bounding_box.extent
+
+        # Start slightly above ground (center of bbox)
+        start_loc = transform.location + carla.Vector3D(0, 0, extent.z)
+
+        # Local directions (XY-plane)
+        directions = [
+            carla.Vector3D(1, 0, 0),   # front
+            carla.Vector3D(-1, 0, 0),  # back
+            carla.Vector3D(0, -1, 0),  # left
+            carla.Vector3D(0, 1, 0)    # right
+        ]
+
+        yaw_rad = math.radians(transform.rotation.yaw)
+        distances = []
+
+        for d in directions:
+            # Rotate local direction by yaw
+            x = d.x * math.cos(yaw_rad) - d.y * math.sin(yaw_rad)
+            y = d.x * math.sin(yaw_rad) + d.y * math.cos(yaw_rad)
+            direction_vec = carla.Vector3D(x, y, 0)
+
+            # Move start outside bounding box to avoid self-collision
+            buffer_dist = max(extent.x, extent.y) + 0.5
+            ray_start = start_loc + direction_vec.make_unit_vector() * buffer_dist
+            ray_end = ray_start + direction_vec.make_unit_vector() * ray_length
+
+            # Raycast
+            hits = self.world.cast_ray(ray_start, ray_end)
+
+            if hits:
+                # Compute distance manually
+                distance = min(hit.location.distance(ray_start) for hit in hits)
+            else:
+                distance = ray_length
+
+            distances.append(distance)
+
+        return np.array(distances, dtype=np.float32)
+
+
+
 
     def _on_collision(self, event):
         # filtering out collisions with the ground which seem to be erroneous

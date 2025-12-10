@@ -22,6 +22,7 @@ class CurriculumCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         env = self.training_env.envs[0].unwrapped  # single DummyVecEnv
+
         if self.num_timesteps >= self.phase3_step and env.phase != 3:
             # env.set_phase(3)
             if self.verbose:
@@ -40,12 +41,14 @@ class SuccessRateCallback(BaseCallback):
         super().__init__(verbose)
         self.window_size = window_size
         self.episode_successes = []
+        self.num_episodes = 0
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
         dones = self.locals.get("dones", [])
         for done, info in zip(dones, infos):
             if done:
+                self.num_episodes += 1
                 success = 1.0 if info.get("goal_reached") or info.get("is_success") else 0.0
                 self.episode_successes.append(success)
                 if len(self.episode_successes) > self.window_size:
@@ -54,6 +57,12 @@ class SuccessRateCallback(BaseCallback):
                 self.logger.record("metrics/success_rate", success_rate)
                 if self.verbose:
                     print(f"[Success] rate over last {len(self.episode_successes)} eps: {success_rate:.3f}")
+        if (len(self.episode_successes) > 0 and self.num_episodes > 200 and sum(self.episode_successes) / len(self.episode_successes) > 0.8):
+            env = self.training_env.envs[0].unwrapped 
+            env.increase_difficulty()
+            print(f"Increased Difficulty to {env.base_env.difficulty}")
+            self.episode_successes = []
+            self.num_episodes = 0
         return True
 
 
@@ -84,6 +93,42 @@ class EpisodeLoggerCallback(BaseCallback):
                 if self.verbose:
                     print(msg)
         return True
+    
+class ActionStatsCallback(BaseCallback):
+    """
+    Logs mean/min/max of actions, log_probs, and PPO ratios to TensorBoard.
+    Works with SB3 PPO.
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Access the PPO rollout buffer
+        buf = getattr(self.model, "rollout_buffer", None)
+        if buf is None or buf.pos == 0:
+            return True
+
+        # Slice only the filled part of the rollout buffer
+        actions = buf.actions[:buf.pos]
+
+        throttle = actions[:, 0, 0]
+        brake = actions[:, 0, 1]
+        steer = actions[:, 0, 2]
+        reverse = actions[:, 0, 3]
+
+        throttle_mean = throttle.mean().item()
+        steer_mean = steer.mean().item()
+        reverse_mean = reverse.mean().item()
+        brake_mean = brake.mean().item()
+
+
+        # --- Log to TensorBoard ---
+        self.logger.record("policy/throttle_mean", throttle_mean)
+        self.logger.record("policy/steer_mean", steer_mean)
+        self.logger.record("policy/brake_mean", brake_mean)
+        self.logger.record("policy/reverse_mean", reverse_mean)
+
+        return True
 
 
 def make_env(args):
@@ -101,13 +146,20 @@ def make_env(args):
 
     return _init
 
+def linear_lr(progress_remaining: float) -> float:
+    # 1e-4 at start -> 1e-5 at end
+    return 1e-5 + (1e-4 - 1e-5) * progress_remaining
+
+def ent_schedule(progress_remaining: float) -> float:
+    # 0.02 -> 0.001 over training
+    return 0.0005 + (0.01 - 0.0005) * progress_remaining
 
 def main():
     parser = argparse.ArgumentParser(description="Train PPO agent on truck parking (SB3).")
     parser.add_argument("--total-steps", type=int, default=10_000_000, help="Total training timesteps.")
     parser.add_argument("--n-steps", type=int, default=2048, help="Rollout steps per update.")
     parser.add_argument("--batch-size", type=int, default=256, help="PPO batch size.")
-    parser.add_argument("--learning-rate", type=float, default=5e-5, help="PPO learning rate.")
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="PPO learning rate.")
     parser.add_argument("--phase2-step", type=int, default=250_000, help="When to start curriculum phase 2.")
     parser.add_argument("--phase3-step", type=int, default=500_000, help="When to start curriculum phase 3.")
     parser.add_argument("--max-episode-steps", type=int, default=1000, help="Episode cap (matching paper).")
@@ -126,7 +178,7 @@ def main():
 
     env = DummyVecEnv([make_env(args)])
 
-    policy_kwargs = dict(net_arch=[512, 512])
+    policy_kwargs = dict(net_arch=[1024, 1024, 512])
     tb_log_dir = "runs/ppo_sb3"
     os.makedirs(tb_log_dir, exist_ok=True)
 
@@ -137,8 +189,13 @@ def main():
             model = PPO.load(
                 args.bc_init,
                 env=env,
-                custom_objects={"learning_rate": args.learning_rate},
-                tensorboard_log=tb_log_dir,
+                custom_objects={
+                    "learning_rate": linear_lr,
+                    # "ent_coef": 0.0005,
+                    # "vf_coef": 0.25,
+                    # "clip_range": 0.2
+                },                
+                tensorboard_log=tb_log_dir
             )
         except Exception as e:
             print(f"SB3 load failed ({e}), trying torch state_dict fallback...")
@@ -146,14 +203,14 @@ def main():
             model = PPO(
                 "MlpPolicy",
                 env,
-                learning_rate=args.learning_rate,
+                learning_rate=linear_lr,#args.learning_rate,
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
-                gamma=0.999,
-                gae_lambda=0.95,
+                gamma=0.998,
+                gae_lambda=0.98,
                 clip_range=0.2,
-                ent_coef=0.001,
-                verbose=1,
+                ent_coef=0.0005,
+                verbose=0,
                 policy_kwargs=policy_kwargs,
                 tensorboard_log=tb_log_dir,
                 vf_coef=0.2,
@@ -174,16 +231,20 @@ def main():
         model = PPO(
             "MlpPolicy",
             env,
-            learning_rate=args.learning_rate,
+            learning_rate=linear_lr,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.1,
-            ent_coef=0.001,
+            gamma=0.998,
+            gae_lambda=0.98,
+            clip_range=0.15,
+            ent_coef=0.0005,
+            vf_coef=0.25,
             verbose=1,
             policy_kwargs=policy_kwargs,
             tensorboard_log=tb_log_dir,
+            normalize_advantage=True,
+            n_epochs=6,
+            device="cuda"
         )
 
     callback = CallbackList(
@@ -191,16 +252,21 @@ def main():
             CurriculumCallback(
                 phase2_step=args.phase2_step,
                 phase3_step=args.phase3_step,
-                verbose=1,
+                verbose=0,
             ),
             SuccessRateCallback(window_size=100, verbose=0),
             EpisodeLoggerCallback(verbose=1),
+            ActionStatsCallback(verbose=0)
         ]
     )
 
-    model.learn(total_timesteps=args.total_steps, callback=callback)
-    model.save(args.output)
-    env.close()
+    try:
+        model.learn(total_timesteps=args.total_steps, callback=callback)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        model.save(args.output)
+        env.close()
 
 
 if __name__ == "__main__":
