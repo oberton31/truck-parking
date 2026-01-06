@@ -87,9 +87,9 @@ class TruckEnv:
         self.world.apply_settings(settings)
 
         self.goal_pos = None
-        self.difficulty = 0.0 # 0 is easiest, 1 is hardest
-        self.min_difficulty = 0.5
-        self.max_difficulty = 6.0
+        self.difficulty = 1.0 # 0 is easiest, 1 is hardest
+        self.min_difficulty = 0.0
+        self.max_difficulty = 3.0 # 4 meter offset, not insignificant
 
         self.goal_points = [
             (carla.Transform(carla.Location(-43.5, 188.5, 1), carla.Rotation(0, -90, 0)), "Bottom Right"),
@@ -163,15 +163,15 @@ class TruckEnv:
             #spawn_point.rotation.yaw += self.difficulty * 20.0  # Scale yaw rotation with difficulty (0-45 degrees)
             # Training regimen: start near the goal
             if rand_goal_name in ["Bottom Right", "Bottom Center", "Bottom Left"]:
-                spawn_point.location.y -= self.difficulty * (18 - 3) + 3 + np.random.uniform(-2, 2)
+                spawn_point.location.y -= self.difficulty * (15 - 3) + 3 + np.random.uniform(-2, 2)
                 max_width = self.difficulty * (self.max_difficulty - self.min_difficulty) + self.min_difficulty
                 u = np.random.uniform(-1, 1)
-                spawn_point.location.x += np.sign(u) * (np.abs(u) ** (1/2)) * max_width # scale this up later
+                spawn_point.location.x += np.random.uniform(-max_width, max_width) #np.sign(u) * (np.abs(u) ** (1/2)) * max_width # scale this up later
             else:
-                spawn_point.location.x -= self.difficulty * (18 - 3) + 3 + np.random.uniform(-2, 2)
+                spawn_point.location.x -= self.difficulty * (15 - 3) + 3 + np.random.uniform(-2, 2)
                 max_width = self.difficulty * (self.max_difficulty - self.min_difficulty) + self.min_difficulty
                 u = np.random.uniform(-1, 1)
-                spawn_point.location.y += np.sign(u) * (np.abs(u) ** (1/2)) * max_width # scale this up later
+                spawn_point.location.y += np.random.uniform(-max_width, max_width) #np.sign(u) * (np.abs(u) ** (1/2)) * max_width # scale this up later
 
         
 
@@ -479,7 +479,7 @@ class TruckEnv:
         else:
             return False
 
-    def _compute_rays_from_transform(self, transform, actor, ray_length=20.0):
+    def _compute_rays_from_transform(self, transform, actor, ray_length=20.0, trailer=False):
         """
         Cast rays from a transform while avoiding self-collision.
 
@@ -497,29 +497,43 @@ class TruckEnv:
 
         # Bounding box extents
         extent = actor.bounding_box.extent
+        bound_x = 0.5 + actor.bounding_box.extent.x
+        bound_y = 0.5 + actor.bounding_box.extent.y
+        bound_z = 0.5 + actor.bounding_box.extent.z
 
         # Start slightly above ground (center of bbox)
         start_loc = transform.location + carla.Vector3D(0, 0, extent.z)
 
         # Local directions (XY-plane)
-        directions = [
-            carla.Vector3D(1, 0, 0),   # front
-            carla.Vector3D(-1, 0, 0),  # back
-            carla.Vector3D(0, -1, 0),  # left
-            carla.Vector3D(0, 1, 0)    # right
-        ]
+        if trailer:
+            directions = [
+                carla.Vector3D(-1, 0, 0),  # back
+                carla.Vector3D(0, -1, 0),  # left
+                carla.Vector3D(0, 1, 0)    # right
+            ]
+        else:
+            directions = [
+                carla.Vector3D(1, 0, 0),   # front
+                carla.Vector3D(0, -1, 0),  # left
+                carla.Vector3D(0, 1, 0)    # right
+            ]
 
         yaw_rad = math.radians(transform.rotation.yaw)
         distances = []
 
-        for d in directions:
+        for i, d in enumerate(directions):
             # Rotate local direction by yaw
             x = d.x * math.cos(yaw_rad) - d.y * math.sin(yaw_rad)
             y = d.x * math.sin(yaw_rad) + d.y * math.cos(yaw_rad)
             direction_vec = carla.Vector3D(x, y, 0)
 
             # Move start outside bounding box to avoid self-collision
-            buffer_dist = max(extent.x, extent.y) + 0.5
+            if trailer and i == 0:
+                buffer_dist = 2.2 * bound_x
+            elif not trailer and i == 0:
+                buffer_dist = 0.8 * bound_x
+            else:
+                buffer_dist = 0.8 * bound_y
             ray_start = start_loc + direction_vec.make_unit_vector() * buffer_dist
             ray_end = ray_start + direction_vec.make_unit_vector() * ray_length
 

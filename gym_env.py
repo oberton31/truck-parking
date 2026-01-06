@@ -31,7 +31,7 @@ class TruckParkingGymEnv(gym.Env):
     def __init__(
         self,
         max_episode_steps: int = 1000,
-        phase: int = 1,
+        phase: int = 2,
         decision_period: int = 4,
         stack_size: int = 5,
         use_cameras: bool = False,
@@ -50,6 +50,7 @@ class TruckParkingGymEnv(gym.Env):
             map_location=map_location,
             use_cameras=False,
         )
+        print(f"Phase: {phase}")
         # Ensure rendering follows use_cameras choice
         settings = self.base_env.world.get_settings()
         settings.no_rendering_mode = not RENDER_CARLA
@@ -63,7 +64,7 @@ class TruckParkingGymEnv(gym.Env):
         self._rng = np.random.default_rng()
 
         # Observation: pos_rel(3) + vel(2) + accel(2) + trailer_angle(1) + reverse(1)
-        self._obs_dim = 9 + 8
+        self._obs_dim = 9 + 6
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -128,8 +129,8 @@ class TruckParkingGymEnv(gym.Env):
         trailer_angle = self._compute_trailer_angle() / 180.0
         reverse_flag = 1.0 if self.base_env.control.reverse else 0.0
 
-        cab_rays = self.base_env._compute_rays_from_transform(self.base_env.player.get_transform(), self.base_env.player)
-        trailer_rays = self.base_env._compute_rays_from_transform(self.base_env.playerTrailer.get_transform(), self.base_env.playerTrailer)
+        cab_rays = self.base_env._compute_rays_from_transform(self.base_env.player.get_transform(), self.base_env.player, trailer=False)
+        trailer_rays = self.base_env._compute_rays_from_transform(self.base_env.playerTrailer.get_transform(), self.base_env.playerTrailer, trailer=True)
 
         ray_obs = np.concatenate([cab_rays, trailer_rays])
 
@@ -186,7 +187,7 @@ class TruckParkingGymEnv(gym.Env):
         vel_mag = math.hypot(vel.x, vel.y)
 
         return (
-            pos_dist < 3.5
+            pos_dist < 2.0
             and angle_dist < 9.0
             and trailer_angle < 12.0
             and vel_mag < 0.1
@@ -511,7 +512,7 @@ class TruckParkingGymEnv(gym.Env):
         self.base_env.phase = int(phase)
     
     def increase_difficulty(self):
-        self.base_env.difficulty = min(self.base_env.difficulty+0.05, 1)
+        self.base_env.difficulty = min(self.base_env.difficulty+0.1, 1)
 
     def close(self):
         self._destroy_npvs()
