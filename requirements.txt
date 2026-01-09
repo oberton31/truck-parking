@@ -1,6 +1,0 @@
-# Minimal Python dependencies for training
-numpy
-Pillow
-torch
-torchvision
-tqdm
